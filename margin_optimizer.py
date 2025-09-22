@@ -1,449 +1,135 @@
 import numpy as np
 import pandas as pd
-from abc import ABC, abstractmethod
 from scipy.optimize import milp, LinearConstraint
+from base import Exchange, PositionType
+from combination_strategies import StrategyType, StrategyAnalyzer
 
 
-class MarginOptimizerBase(ABC):
-    @abstractmethod
-    def _combine(self, pos, pos_given):
-        pass
-
-    @abstractmethod
-    def _find_available_combinations(self):
-        pass
-
-    @abstractmethod
-    def _optimize(self, avail_combs):
-        pass
-
-    @abstractmethod
-    def run(self):
-        pass
-
-    @classmethod
-    def create_optimizer(cls, holding, exchange, is_close):
-        match exchange:
-            case 'XSHG' | 'SH':
-                return MarginOptimizerOptions(holding, is_close)
-            case 'XSHE' | 'SZ':
-                return MarginOptimizerOptions(holding, is_close)
-            case 'CCFX' | 'CFE':
-                return MarginOptimizerFutures(holding, allow_intercommodity=True)
-            case 'XSGE' | 'SHFE':
-                return MarginOptimizerFutures(holding, allow_intercommodity=False)
-            case 'XDCE' | 'DCE':
-                pass
-            case 'XZCE' | 'CZCE':
-                pass
-            case _:
-                raise ValueError(f'Unsupported exchange: {exchange}.')
-
-
-class MarginOptimizerFutures(MarginOptimizerBase):
-    def __init__(self, holding, allow_intercommodity):
-        self.holding = holding
-        self.allow_intercommodity = allow_intercommodity
-
-    def _combine(self, pos, pos_given):
-        pass
-
-    def _find_available_combinations(self):
-        pass
-
-    def _optimize(self):
-        holding_futures = self.holding[self.holding['type']=='future'].copy()
-        if holding_futures.empty:
-            return
-
-        holding_futures['total_margin'] = holding_futures.apply(
-                lambda x: x['quantity'] * x['margin'], axis=1)
-        if self.allow_intercommodity:
-            larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
-            self.holding.loc[
-                (self.holding['type']=='future') &
-                (self.holding['long_short']!=larger_side),
-                'margin'] = 0
-        else:
-            for variety, holding_variety in holding_futures.groupby('variety'):
-                larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
-                self.holding.loc[
-                    (self.holding['type']=='future') &
-                    (self.holding['variety']==variety) &
-                    (self.holding['long_short']!=larger_side),
-                    'margin'] = 0
-
-    def run(self):
-        self._optimize()
-        self.holding = self.holding[['code', 'type', 'quantity', 'margin']]
-
-
-class MarginOptimizerOptions(MarginOptimizerBase):
-    def __init__(self, holding, is_close):
+class MarginOptimizer:
+    def __init__(self, holding: pd.DataFrame, is_close: bool):
         self.holding = holding
         self.is_close = is_close
 
-    def _combine(self, pos: pd.Series, pos_given: pd.Series) -> dict:
-        """
-        将两手期权持仓进行组合, 并计算组合的保证金及所节省的保证金
+    def _analyze_strategy(self, pos: pd.Series, pos_given: pd.Series) -> dict:
+        """分析两手持仓可构成的组合策略, 并计算其组合保证金"""
+        analyzer = StrategyAnalyzer.create_analyzer(pos, pos_given, self.is_close)
+        return analyzer.analyze()
 
-        :param pos: 一手持仓
-        :param pos_given: 给定的一手空头持仓
-        :type pos: pd.Series
-        :type pos_given: pd.Series
-        :returns: 组合类型, 组合保证金, 保证金节省
-        :rtype: dict
-        """
+    def _find_available_strategies(self, holding_account: pd.DataFrame) -> pd.DataFrame:
+        """寻找某个账号持仓的所有可行组合策略"""
+        holding_account = holding_account[
+            holding_account['type'].isin((PositionType.Future, PositionType.Option))
+            ].reset_index(drop=True)
+        avail_strats = pd.DataFrame(columns=['code', 'type', 'margin', 'margin_saving'])
 
-        margin_original = pos['margin'] + pos_given['margin']
-        
-        if pos_given['call_put'] == 'call':
-            if pos['long_short'] == 'long' and pos['call_put'] == 'call':
-                if pos['strike_price'] - pos_given['strike_price'] < -1e-6:  # 牛市看涨价差
-                    margin_combination = 0
-                    return {
-                        'type': 'CNSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
+        for n_row, pos in holding_account.iterrows():
+            if n_row == len(holding_account) - 1:
+                break
+            pos_to_analyze = holding_account[n_row+1:].copy()
+            pos_to_analyze[['type', 'margin', 'margin_saving']] = pos_to_analyze.apply(
+                lambda x: pd.Series(self._analyze_strategy(x, pos)), axis=1)
+            pos_to_analyze = pos_to_analyze[['code', 'type', 'margin', 'margin_saving']]
+            pos_to_analyze = pos_to_analyze[pos_to_analyze['type'] != StrategyType.Invalid]
+            pos_to_analyze = pos_to_analyze[pos_to_analyze['margin_saving'] > 0]
+            pos_to_analyze['code'] = pos_to_analyze['code'].apply(
+                lambda x: (pos['code'], x))
+            avail_strats = pd.concat([avail_strats, pos_to_analyze], ignore_index=True)
+        return avail_strats
 
-                elif pos['strike_price'] - pos_given['strike_price'] > 1e-6:  # 熊市看涨价差
-                    margin_combination = (pos['strike_price'] - pos_given['strike_price']) * pos['multiplier']
-                    return {
-                        'type': 'CXSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
+    def _optimize(self, holding_account: pd.DataFrame) -> pd.DataFrame:
+        """单个账号持仓的保证金优化"""
+        avail_strats = self._find_available_strategies(holding_account)
+        if avail_strats.empty:
+            return holding_account[['code', 'type', 'quantity', 'margin']].copy()
 
-                else:  # 自动对冲
-                    margin_combination = 0
-                    return {
-                        'type': 'AutoHedge',
-                        'margin': margin_combination,
-                        'margin_saving': max(margin_original - margin_combination - 1, 0)  # 自动对冲惩罚项
-                    }
+        '''
+        MILP:
+            Decision Variables: x        # 每个组合的数量
+            Objective: max c^T * x        # 最大化节省保证金
+            Subject to: lb <= A * x <= ub        # 持仓数量约束
+                        x : Non-negative integers
+        '''
 
-            elif pos['long_short'] == 'short' and pos['call_put'] == 'put':
-                if abs(pos['strike_price'] - pos_given['strike_price']) < 1e-6:  # 跨式
-                    if pos['margin'] < pos_given['margin']:
-                        margin_combination = pos_given['margin'] + pos['s'] * pos['multiplier']
-                    else:
-                        margin_combination = pos['margin'] + pos_given['s'] * pos_given['multiplier']
-                    return {
-                        'type': 'KS',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
-
-                elif pos['strike_price'] < pos_given['strike_price']:  # 宽跨式
-                    if pos['margin'] < pos_given['margin']:
-                        margin_combination = pos_given['margin'] + pos['s'] * pos['multiplier']
-                    else:
-                        margin_combination = pos['margin'] + pos_given['s'] * pos_given['multiplier']
-                    return {
-                        'type': 'KKS',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
-
-        elif pos_given['call_put'] == 'put':
-            if pos['long_short'] == 'long' and pos['call_put'] == 'put':
-                if pos['strike_price'] - pos_given['strike_price'] < -1e-6:  # 牛市看跌价差
-                    margin_combination = (pos_given['strike_price'] - pos['strike_price']) * pos['multiplier']
-                    return {
-                        'type': 'PNSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
-
-                elif pos['strike_price'] - pos_given['strike_price'] > 1e-6:  # 熊市看跌价差
-                    margin_combination = 0
-                    return {
-                        'type': 'PXSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    }
-
-                else:  # 自动对冲
-                    margin_combination = 0
-                    return {
-                        'type': 'AutoHedge',
-                        'margin': margin_combination,
-                        'margin_saving': max(margin_original - margin_combination - 1, 0)  # 自动对冲惩罚项
-                    }
-
-        return {
-            'type': 'Invalid',
-            'margin': margin_original,
-            'margin_saving': 0
-        }
-
-    def _find_available_combinations(self):
-        """
-        查找持仓中可以组合的期权对, 计算保证金节省
-
-        :returns: 可行的期权组合
-        :rtype: pd.DataFrame
-        """
-
-        avail_combs = pd.DataFrame(columns=['code', 'type', 'margin', 'margin_saving'])
-        holding_options = self.holding[self.holding['type']=='option'].copy()
-        if holding_options.empty:
-            return avail_combs
-        
-        for _, holding_udl in self.holding.groupby(['udl', 'last_tradedate']):
-            for _, pos in holding_udl[holding_udl['long_short']=='short'].iterrows():
-                holding_udl[['type', 'margin', 'margin_saving']] = holding_udl.apply(
-                    lambda x: pd.Series(self._combine(x, pos).values()), axis=1)
-                pos_to_combine = holding_udl[holding_udl['type']!='Invalid']
-                pos_to_combine = pos_to_combine[pos_to_combine['margin_saving']>0]
-                pos_to_combine = pos_to_combine[['code', 'type', 'margin', 'margin_saving']]
-                pos_to_combine['code'] = pos_to_combine['code'].apply(
-                    lambda x: (pos['code'], x))
-                avail_combs = pd.concat([avail_combs, pos_to_combine], ignore_index=True)
-        return avail_combs
-
-    def _optimize(self, avail_combs, allow_autohedge=None):
-        """
-        优化期权组合以最大化保证金节省
-
-        :param avail_combs: 可行的期权组合
-        :type avail_combs: pd.DataFrame
-        :param allow_autohedge: 是否允许自动对冲, defaults to False
-        :type allow_autohedge: bool, optional
-        :returns: 剩余持仓和选择的组合
-        :rtype: (pd.DataFrame, pd.DataFrame)
-        """
-
-        if allow_autohedge is None:
-            allow_autohedge = self.is_close
-        if not allow_autohedge:
-            avail_combs = avail_combs[avail_combs['type']!='AutoHedge'].reset_index(drop=True)
-        if avail_combs.empty:
-            self.holding = self.holding[['code', 'type', 'quantity', 'margin']]
-            return
-
-        c = avail_combs['margin_saving'].values
-        ub = self.holding['quantity'].values
+        c = avail_strats['margin_saving'].values
+        ub = holding_account['quantity'].values
         lb = np.zeros_like(ub)
-        A = np.zeros([len(self.holding), len(avail_combs)])
-        for j, pos in enumerate(avail_combs['code']):
-            pos1, pos2 = pos
-            i1 = self.holding.index[self.holding['code']==pos1][0]
-            i2 = self.holding.index[self.holding['code']==pos2][0]
+        A = np.zeros([len(holding_account), len(avail_strats)])
+        for j, (pos1, pos2) in enumerate(avail_strats['code']):
+            i1 = holding_account.index[holding_account['code'] == pos1][0]
+            i2 = holding_account.index[holding_account['code'] == pos2][0]
             A[i1, j] = 1
             A[i2, j] = 1
         constraints = LinearConstraint(A, lb, ub)
         integrality = np.ones_like(c)
         res = milp(c=-c, constraints=constraints, integrality=integrality)
+
         if res.success:
-            selected_combs = pd.DataFrame({
-                'code': avail_combs['code'],
-                'type': avail_combs['type'],
+            selected_strats = pd.DataFrame({
+                'code': avail_strats['code'],
+                'type': avail_strats['type'],
                 'quantity': res.x,
-                'margin': avail_combs['margin']
+                'margin': avail_strats['margin']
             })
-            selected_combs = selected_combs.loc[selected_combs['quantity']>0].reset_index(drop=True)
+            selected_strats = selected_strats.loc[selected_strats['quantity'] > 0].reset_index(drop=True)
             remaining_pos = pd.DataFrame({
-                'code': self.holding['code'],
-                'type': self.holding['type'],
+                'code': holding_account['code'],
+                'type': holding_account['type'],
                 'quantity': ub - A @ res.x,
-                'margin': self.holding['margin']
+                'margin': holding_account['margin']
             })
-            remaining_pos = remaining_pos.loc[remaining_pos['quantity']>0].reset_index(drop=True)
-            self.holding = pd.concat([remaining_pos, selected_combs], ignore_index=True)
+            remaining_pos = remaining_pos.loc[remaining_pos['quantity'] > 0].reset_index(drop=True)
+            return pd.concat([remaining_pos, selected_strats], ignore_index=True)
         else:
             raise ValueError("Optimization failed.")
 
-    def run(self):
-        avail_combs = self._find_available_combinations()
-        self._optimize(avail_combs)
+    def _handle_CFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
+        """中国金融期货交易所: 期货对锁、跨期、跨品种，单向大边保证金"""
+        holding_futures = holding_account[holding_account['type'] == PositionType.Future].copy()
+        if not holding_futures.empty:
+            holding_futures['total_margin'] = holding_futures.apply(
+                    lambda x: x['quantity'] * x['margin'], axis=1)
+            larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
+            holding_account.loc[(
+                (holding_account['type'] == PositionType.Future) &
+                (holding_account['long_short'] != larger_side)
+        ), 'margin'] = 0
+        return holding_account[['code', 'type', 'quantity', 'margin']].copy()
 
+    def _handle_SHFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
+        """上海期货交易所: 期货对锁、跨期，单向大边保证金"""
+        holding_futures = holding_account[holding_account['type'] == PositionType.Future].copy()
+        if not holding_futures.empty:
+            holding_futures['total_margin'] = holding_futures.apply(
+                    lambda x: x['quantity'] * x['margin'], axis=1)
+            for variety, holding_variety in holding_futures.groupby('variety'):
+                    larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
+                    holding_account.loc[(
+                        (holding_account['type'] == PositionType.Future) &
+                        (holding_account['variety'] == variety) &
+                        (holding_account['long_short'] != larger_side)
+                    ), 'margin'] = 0
+        return holding_account[['code', 'type', 'quantity', 'margin']].copy()
 
-class MarginOptimizerFuturesOptions(MarginOptimizerBase):
-    def __init__(self, holding, is_close):
-        self.holding = holding
-        self.is_close = is_close
+    def _handle_each_account(self, holding_account: pd.DataFrame, exchange: Exchange) -> pd.DataFrame:
+        if exchange == Exchange.CFE:
+            return self._handle_CFE(holding_account)
+        elif exchange == Exchange.SHFE:
+            return self._handle_SHFE(holding_account)
+        else:
+            return self._optimize(holding_account)
     
-    def _combine(self, pos, pos_given):
-        if pos_given['type'] == 'future':
-            pass
-    
-    def _combine_futures(self, pos, pos_given):
-        margin_original = pos['margin'] + pos_given['margin']
-        combination_result = {
-            'type': 'Invalid',
-            'margin': margin_original,
-            'margin_saving': 0
-        }
-
-        if pos['long_short'] == 'short':
-            return combination_result
-        
-        if pos['code_original'] == pos_given['code_original']:  # 期货对锁
-            margin_combination = max(pos['margin'], pos_given['margin'])
-            combination_result = ({
-                'type': 'FutureLockPosition',
-                'margin': margin_combination,
-                'margin_saving': margin_original - margin_combination
-            })
-
-        elif pos['variety'] == pos_given['variety']:  # 期货跨期
-            margin_combination = max(pos['margin'], pos_given['margin'])
-            combination_result = ({
-                'type': 'CalendarSpread',
-                'margin': margin_combination,
-                'margin_saving': margin_original - margin_combination
-            })
-
-        # elif pos['variety'].group == pos['variety'].group:  # 期货跨品种
-        #     margin_combination = max(pos['margin'], pos_given['margin'])
-        #     combination_result = ({
-        #         'type': 'IntercommoditySpread',
-        #         'margin': margin_combination,
-        #         'margin_saving': margin_original - margin_combination
-        #     })
-
-
-    def _combine_options(self, pos: pd.Series, pos_given: pd.Series) -> dict:
-        """
-        将两手期权持仓进行组合, 并计算组合的保证金及所节省的保证金
-
-        :param pos: 一手持仓
-        :param pos_given: 给定的一手空头持仓
-        :type pos: pd.Series
-        :type pos_given: pd.Series
-        :returns: 组合类型, 组合保证金, 保证金节省
-        :rtype: dict
-        """
-
-        margin_original = pos['margin'] + pos_given['margin']
-        combination_result = {
-            'type': 'Invalid',
-            'margin': margin_original,
-            'margin_saving': 0
-        }
-        
-        if pos_given['call_put'] == 'call':
-            if pos['long_short'] == 'long' and pos['call_put'] == 'call':
-                if pos['strike_price'] - pos_given['strike_price'] < -1e-6:  # 牛市看涨价差
-                    margin_combination = pos_given['margin'] * 0.2
-                    combination_result.update({
-                        'type': 'CNSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-                
-                elif pos['strike_price'] - pos_given['strike_price'] > 1e-6:  # 熊市看涨价差
-                    margin_combination = min(
-                        (pos['strike_price'] - pos_given['strike_price']) * pos['multiplier'],
-                        pos_given['margin']
-                    )
-                    combination_result.update({
-                        'type': 'CXSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-                
-                else:  # 期权对锁
-                    margin_combination = pos_given['margin'] * 0.2
-                    combination_result.update({
-                        'type': 'OptionLockPosition',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-                
-            elif pos['long_short'] == 'short' and pos['call_put'] == 'put':
-                if abs(pos['strike_price'] - pos_given['strike_price']) < 1e-6:  # 跨式
-                    if pos['margin'] < pos_given['margin']:
-                        margin_combination = pos_given['margin'] + pos['s'] * pos['multiplier']
-                    else:
-                        margin_combination = pos['margin'] + pos_given['s'] * pos_given['multiplier']
-                    combination_result.update({
-                        'type': 'KS',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-
-                elif pos['strike_price'] < pos_given['strike_price']:  # 宽跨式
-                    if pos['margin'] < pos_given['margin']:
-                        margin_combination = pos_given['margin'] + pos['s'] * pos['multiplier']
-                    else:
-                        margin_combination = pos['margin'] + pos_given['s'] * pos_given['multiplier']
-                    combination_result.update({
-                        'type': 'KKS',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-        
-        elif pos_given['call_put'] == 'put':
-            if pos['long_short'] == 'long' and pos['call_put'] == 'put':
-                if pos['strike_price'] - pos_given['strike_price'] < -1e-6:  # 牛市看跌价差
-                    margin_combination = min(
-                        (pos_given['strike_price'] - pos['strike_price']) * pos['multiplier'],
-                        pos_given['margin']
-                    )
-                    combination_result.update({
-                        'type': 'PNSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-
-                elif pos['strike_price'] - pos_given['strike_price'] > 1e-6:  # 熊市看跌价差
-                    margin_combination = pos_given['margin'] * 0.2
-                    combination_result.update({
-                        'type': 'PXSJC',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-
-                else:  # 期权对锁
-                    margin_combination = pos_given['margin'] * 0.2
-                    combination_result.update({
-                        'type': 'OptionLockPosition',
-                        'margin': margin_combination,
-                        'margin_saving': margin_original - margin_combination
-                    })
-
-        return combination_result
-
-    def _find_available_combinations(self):
-        pass
-
-    def _optimize(self):
-        pass
-
-    def run(self):
-        pass
-
-
-class MarginOptimizer():
-    def __init__ (self, holding, is_close=False):
-        self.holding = holding
-        self.is_close = is_close
-    
-    def run(self):
+    def run(self) -> pd.DataFrame:
+        """对所有账号持仓进行保证金优化"""
         dfs = []
+        self.holding['exchange'] = self.holding['exchange'].apply(lambda x: x.value)
         groups = self.holding.groupby(['exchange', '持仓帐号'])
-        for (exchange, account), holding_exchange_account in groups:
-            holding_exchange_account = holding_exchange_account.reset_index(drop=True)
-            optimizer = MarginOptimizerBase.create_optimizer(holding_exchange_account, exchange, self.is_close)
-            optimizer.run()
-            optimization_result = optimizer.holding
+        for (exchange, account), holding_account in groups:
+            exchange = Exchange(exchange)
+            print(f'Optimizing holding on account {account}.{exchange.name}...')
+            holding_account['exchange'] = exchange
+            holding_account = holding_account.reset_index(drop=True)
+            optimization_result = self._handle_each_account(holding_account, exchange)
             optimization_result['exchange'] = exchange
             optimization_result['account'] = account
             dfs.append(optimization_result)
-        pd.concat(dfs, ignore_index=True).to_csv(f'margin_optimization.csv', index=False, encoding='GB2312')
-
-
-if __name__ == '__main__':
-
-    from holding_data_processor import HoldingDataProcessor
-
-    holding = pd.read_excel('kdb_pos.xlsx').dropna()
-    options_data = pd.read_csv('option_quote.csv', encoding='GB2312').dropna()
-    holding = HoldingDataProcessor.preprocess_holding(holding)
-    
-    optimizer = MarginOptimizer(holding, is_close=True)
-    optimizer.run()
-    print('Completed.')
+        return pd.concat(dfs, ignore_index=True)
