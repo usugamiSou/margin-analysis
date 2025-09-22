@@ -1,0 +1,2 @@
+class MarginCalculator:
+    pass
