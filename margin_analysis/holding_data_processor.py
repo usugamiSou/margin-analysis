@@ -18,9 +18,19 @@ class HoldingDataProcessor:
         :param commodity_options_data: 商品期权市场数据
         :returns: 预处理后的持仓数据
         """
-        holding.rename(columns={'代码': 'code_original'}, inplace=True)
+        holding.rename(columns={'代码': 'code_original', '持仓帐号': 'account'}, inplace=True)
         holding[['exchange', 'type', 'variety']] = holding['code_original'].apply(
-            lambda x: pd.Series(HoldingDataProcessor._find_position_basic_info(x)))
+            lambda x: pd.Series(HoldingDataProcessor.find_position_basic_info(x)))
+
+        holding_futures = holding[holding['type'] is PositionType.Future].copy()
+        holding_options = holding[holding['type'] is PositionType.Option].copy()
+        if not holding_futures.empty:
+            holding_futures = HoldingDataProcessor.supplement_futures_data(
+                holding_futures, futures_data)
+        if not holding_options.empty:
+            holding_options = HoldingDataProcessor.supplement_options_data(
+                holding_options, options_data)
+        holding = pd.concat([holding_futures, holding_options], ignore_index=True)
 
         holding_long = holding[holding['多头持仓'] > 0].drop(columns=['空头持仓'])
         holding_long['long_short'] = 'long'
@@ -33,49 +43,43 @@ class HoldingDataProcessor:
         holding_short['code'] = holding_long['code_original'] + '.S'
         holding = pd.concat([holding_long, holding_short], ignore_index=True)
 
-        holding_futures = holding[holding['type'] == PositionType.Future].copy()
-        if not holding_futures.empty:
-            holding_futures = HoldingDataProcessor._supplement_futures_data(
-                holding_futures, futures_data)
-
-        holding_options = holding[holding['type'] == PositionType.Option].copy()
-        if not holding_options.empty:
-            holding_options = HoldingDataProcessor._supplement_options_data(
-                holding_options, options_data)
-
-        holding = pd.concat([holding_futures, holding_options], ignore_index=True)
+        holding['margin'] = 100000    # TODO: MarginCalculator
+        holding['market_value'] = (holding['pv'] * holding['quantity']
+                                    * holding['long_short'].map({'long': 1, 'short': -1}))
         return holding
 
     @staticmethod
-    def _supplement_futures_data(holding_futures: pd.DataFrame,
+    def supplement_futures_data(holding_futures: pd.DataFrame,
                                  futures_data: pd.DataFrame | list[pd.DataFrame]) -> pd.DataFrame:
         """补充期货持仓的市场数据"""
         if isinstance(futures_data, pd.DataFrame):
             futures_data = [futures_data]
         futures_data = pd.concat(futures_data, ignore_index=True)
-        if 'margin' not in futures_data.columns:
-            futures_data['margin'] = 10000    # TODO: MarginCalculator
+        columns = ['future_code', 'last_tradedate', 'contract_unit', 'pv']
+        futures_data = futures_data[columns]
         holding_futures = pd.merge(holding_futures, futures_data,
                                    left_on=['code_original'], right_on=['future_code'], how='left')
         return holding_futures
 
     @staticmethod
-    def _supplement_options_data(holding_options: pd.DataFrame,
+    def supplement_options_data(holding_options: pd.DataFrame,
                                  options_data: pd.DataFrame | list[pd.DataFrame]) -> pd.DataFrame:
         """补充期权持仓的市场数据"""
         if isinstance(options_data, pd.DataFrame):
             options_data = [options_data]
         options_data = pd.concat(options_data, ignore_index=True)
-        if 'margin' not in options_data.columns:
-            options_data['margin'] = 10000    # TODO: MarginCalculator
+        columns = ['option_code', 'option_mark_code', 'last_tradedate', 'call_put',
+                   'strike_price', 'pv', 's']
+        for field in ['multiplier', 'contract_unit']:
+            if field in options_data.columns:
+                columns.append(field)
+        options_data = options_data[columns]
         holding_options = pd.merge(holding_options, options_data,
                                    left_on=['code_original'], right_on=['option_code'], how='left')
-        holding_options['margin'] *= holding_options['long_short'].map({'long': 0, 'short': 1})
-
         return holding_options
 
     @staticmethod
-    def _find_position_basic_info(code: str) -> dict:
+    def find_position_basic_info(code: str) -> dict:
         """根据持仓代码判断交易所和持仓类型"""
         code, exchange_code = code.split('.')
 
@@ -117,48 +121,48 @@ class HoldingDataProcessor:
                 match_future = re.match(r'^([A-Za-z]+)[0-9]{4}$', code)
                 if match_future:
                     position_type = PositionType.Future
-                    variety = FutureVariety(match_future.group(1).upper())
+                    variety = FutureVariety[match_future.group(1).upper()]
                 else:
                     match_option = re.match(r'^([A-Za-z]+])[0-9]{4}.+', code)
                     if match_option:
                         position_type = PositionType.Option
-                        variety = FutureVariety(match_option.group(1).upper())
+                        variety = FutureVariety[match_option.group(1).upper()]
 
             case 'XZCE' | 'CZCE':
                 exchange = Exchange.CZCE
                 match_future = re.match(r'^([A-Za-z]+)[0-9]{4}$', code)
                 if match_future:
                     position_type = PositionType.Future
-                    variety = FutureVariety(match_future.group(1).upper())
+                    variety = FutureVariety[match_future.group(1).upper()]
                 else:
                     match_option = re.match(r'^([A-Za-z]+])[0-9]{4}.+', code)
                     if match_option:
                         position_type = PositionType.Option
-                        variety = FutureVariety(match_option.group(1).upper())
+                        variety = FutureVariety[match_option.group(1).upper()]
 
             case 'XDCE' | 'DCE':
                 exchange = Exchange.DCE
                 match_future = re.match(r'^([A-Za-z]+)[0-9]{4}$', code)
                 if match_future:
                     position_type = PositionType.Future
-                    variety = FutureVariety(match_future.group(1).upper())
+                    variety = FutureVariety[match_future.group(1).upper()]
                 else:
                     match_option = re.match(r'^([A-Za-z]+])[0-9]{4}.+$', code)
                     if match_option:
                         position_type = PositionType.Option
-                        variety = FutureVariety(match_option.group(1).upper())
+                        variety = FutureVariety[match_option.group(1).upper()]
 
             case 'GFEX':
                 exchange = Exchange.GFEX
                 match_future = re.match(r'^([A-Za-z]+)[0-9]{4}$', code)
                 if match_future:
                     position_type = PositionType.Future
-                    variety = FutureVariety(match_future.group(1).upper())
+                    variety = FutureVariety[match_future.group(1).upper()]
                 else:
                     match_option = re.match(r'^([A-Za-z]+])[0-9]{4}.+$', code)
                     if match_option:
                         position_type = PositionType.Option
-                        variety = FutureVariety(match_option.group(1).upper())
+                        variety = FutureVariety[match_option.group(1).upper()]
 
             case _:
                 raise ValueError('Invalid exchange code.')

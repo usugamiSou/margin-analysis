@@ -8,6 +8,7 @@ from combination_strategies import StrategyType, StrategyAnalyzer
 class MarginOptimizer:
     def __init__(self, holding: pd.DataFrame, is_close: bool):
         self.holding = holding
+        self.holding_separated = self.holding
         self.is_close = is_close
 
     def _analyze_strategy(self, pos: pd.Series, pos_given: pd.Series) -> dict:
@@ -15,32 +16,31 @@ class MarginOptimizer:
         analyzer = StrategyAnalyzer.create_analyzer(pos, pos_given, self.is_close)
         return analyzer.analyze()
 
-    def _find_available_strategies(self, holding_account: pd.DataFrame) -> pd.DataFrame:
+    def _find_available_strategies(self) -> pd.DataFrame:
         """寻找某个账号持仓的所有可行组合策略"""
-        holding_account = holding_account[
-            holding_account['type'].isin((PositionType.Future, PositionType.Option))
+        self.holding_separated = self.holding_separated[
+            self.holding_separated['type'].isin((PositionType.Future, PositionType.Option))
             ].reset_index(drop=True)
         avail_strats = pd.DataFrame(columns=['code', 'type', 'margin', 'margin_saving'])
 
-        for n_row, pos in holding_account.iterrows():
-            if n_row == len(holding_account) - 1:
+        for i, pos in self.holding_separated.iterrows():
+            if i == len(self.holding_separated) - 1:
                 break
-            pos_to_analyze = holding_account[n_row+1:].copy()
-            pos_to_analyze[['type', 'margin', 'margin_saving']] = pos_to_analyze.apply(
+            temp = self.holding_separated[i+1:].copy()
+            temp[['type', 'margin', 'margin_saving']] = temp.apply(
                 lambda x: pd.Series(self._analyze_strategy(x, pos)), axis=1)
-            pos_to_analyze = pos_to_analyze[['code', 'type', 'margin', 'margin_saving']]
-            pos_to_analyze = pos_to_analyze[pos_to_analyze['type'] != StrategyType.Invalid]
-            pos_to_analyze = pos_to_analyze[pos_to_analyze['margin_saving'] > 0]
-            pos_to_analyze['code'] = pos_to_analyze['code'].apply(
-                lambda x: (pos['code'], x))
-            avail_strats = pd.concat([avail_strats, pos_to_analyze], ignore_index=True)
+            temp = temp[['code', 'type', 'margin', 'margin_saving']]
+            temp = temp[temp['type'] is not StrategyType.Invalid]
+            temp = temp[temp['margin_saving'] > 0]
+            temp['code'] = temp['code'].apply(lambda x: (pos['code'], x))
+            avail_strats = pd.concat([avail_strats, temp], ignore_index=True)
         return avail_strats
 
-    def _optimize(self, holding_account: pd.DataFrame) -> pd.DataFrame:
-        """单个账号持仓的保证金优化"""
-        avail_strats = self._find_available_strategies(holding_account)
+    def _optimize(self) -> pd.DataFrame:
+        """单个账号持仓的组合保证金优化"""
+        avail_strats = self._find_available_strategies()
         if avail_strats.empty:
-            return holding_account[['code', 'type', 'quantity', 'margin']].copy()
+            return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
 
         '''
         MILP:
@@ -51,12 +51,12 @@ class MarginOptimizer:
         '''
 
         c = avail_strats['margin_saving'].values
-        ub = holding_account['quantity'].values
+        ub = self.holding_separated['quantity'].values
         lb = np.zeros_like(ub)
-        A = np.zeros([len(holding_account), len(avail_strats)])
+        A = np.zeros([len(self.holding_separated), len(avail_strats)])
         for j, (pos1, pos2) in enumerate(avail_strats['code']):
-            i1 = holding_account.index[holding_account['code'] == pos1][0]
-            i2 = holding_account.index[holding_account['code'] == pos2][0]
+            i1 = self.holding_separated.index[self.holding_separated['code'] == pos1][0]
+            i2 = self.holding_separated.index[self.holding_separated['code'] == pos2][0]
             A[i1, j] = 1
             A[i2, j] = 1
         constraints = LinearConstraint(A, lb, ub)
@@ -72,64 +72,64 @@ class MarginOptimizer:
             })
             selected_strats = selected_strats.loc[selected_strats['quantity'] > 0].reset_index(drop=True)
             remaining_pos = pd.DataFrame({
-                'code': holding_account['code'],
-                'type': holding_account['type'],
+                'code': self.holding_separated['code'],
+                'type': self.holding_separated['type'],
                 'quantity': ub - A @ res.x,
-                'margin': holding_account['margin']
+                'margin': self.holding_separated['margin']
             })
             remaining_pos = remaining_pos.loc[remaining_pos['quantity'] > 0].reset_index(drop=True)
             return pd.concat([remaining_pos, selected_strats], ignore_index=True)
         else:
             raise ValueError("Optimization failed.")
 
-    def _handle_CFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
-        """中国金融期货交易所: 期货对锁、跨期、跨品种，单向大边保证金"""
-        holding_futures = holding_account[holding_account['type'] == PositionType.Future].copy()
+    def _handle_CFE(self) -> pd.DataFrame:
+        """中金所: 期货对锁、跨期、跨品种, 单向大边保证金"""
+        holding_futures = self.holding_separated[self.holding_separated['type'] is PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
                     lambda x: x['quantity'] * x['margin'], axis=1)
             larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
-            holding_account.loc[(
-                (holding_account['type'] == PositionType.Future) &
-                (holding_account['long_short'] != larger_side)
+            self.holding_separated.loc[(
+                (self.holding_separated['type'] is PositionType.Future) &
+                (self.holding_separated['long_short'] != larger_side)
         ), 'margin'] = 0
-        return holding_account[['code', 'type', 'quantity', 'margin']].copy()
+        return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
 
-    def _handle_SHFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
-        """上海期货交易所: 期货对锁、跨期，单向大边保证金"""
-        holding_futures = holding_account[holding_account['type'] == PositionType.Future].copy()
+    def _handle_SHFE(self) -> pd.DataFrame:
+        """上期所: 期货对锁、跨期, 单向大边保证金"""
+        holding_futures = self.holding_separated[self.holding_separated['type'] is PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
                     lambda x: x['quantity'] * x['margin'], axis=1)
             for variety, holding_variety in holding_futures.groupby('variety'):
                     larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
-                    holding_account.loc[(
-                        (holding_account['type'] == PositionType.Future) &
-                        (holding_account['variety'] == variety) &
-                        (holding_account['long_short'] != larger_side)
+                    self.holding_separated.loc[(
+                        (self.holding_separated['type'] is PositionType.Future) &
+                        (self.holding_separated['variety'] is variety) &
+                        (self.holding_separated['long_short'] != larger_side)
                     ), 'margin'] = 0
-        return holding_account[['code', 'type', 'quantity', 'margin']].copy()
+        return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
 
-    def _handle_each_account(self, holding_account: pd.DataFrame, exchange: Exchange) -> pd.DataFrame:
-        if exchange == Exchange.CFE:
-            return self._handle_CFE(holding_account)
-        elif exchange == Exchange.SHFE:
-            return self._handle_SHFE(holding_account)
+    def _handle_each_account(self, exchange: Exchange) -> pd.DataFrame:
+        if exchange is Exchange.CFE:
+            return self._handle_CFE()
+        elif exchange is Exchange.SHFE:
+            return self._handle_SHFE()
         else:
-            return self._optimize(holding_account)
+            return self._optimize()
     
     def run(self) -> pd.DataFrame:
         """对所有账号持仓进行保证金优化"""
         dfs = []
-        self.holding['exchange'] = self.holding['exchange'].apply(lambda x: x.value)
-        groups = self.holding.groupby(['exchange', '持仓帐号'])
+        self.holding['exchange'] = self.holding['exchange'].apply(lambda x: x.name)
+        groups = self.holding.groupby(['exchange', 'account'])
         for (exchange, account), holding_account in groups:
-            exchange = Exchange(exchange)
-            print(f'Optimizing holding on account {account}.{exchange.name}...')
-            holding_account['exchange'] = exchange
-            holding_account = holding_account.reset_index(drop=True)
-            optimization_result = self._handle_each_account(holding_account, exchange)
-            optimization_result['exchange'] = exchange
+            exchange = Exchange[exchange]
+            self.holding_separated = holding_account.copy()
+            self.holding_separated['exchange'] = exchange
+            self.holding_separated.reset_index(drop=True, inplace=True)
+            optimization_result = self._handle_each_account(exchange)
+            optimization_result['exchange'] = exchange.name
             optimization_result['account'] = account
             dfs.append(optimization_result)
         return pd.concat(dfs, ignore_index=True)

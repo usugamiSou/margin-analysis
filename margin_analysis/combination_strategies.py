@@ -45,9 +45,9 @@ class StrategyAnalyzer:
     @classmethod
     def create_analyzer(cls, pos1: pd.Series, pos2: pd.Series,
                         is_close: bool) -> 'StrategyAnalyzer':
-        if pos1['type'] == PositionType.Future and pos2['type'] == PositionType.Future:
+        if pos1['type'] is PositionType.Future and pos2['type'] is PositionType.Future:
             return FuturesStrategyAnalyzer(pos1, pos2, is_close)
-        elif pos1['type'] == PositionType.Option and pos2['type'] == PositionType.Option:
+        elif pos1['type'] is PositionType.Option and pos2['type'] is PositionType.Option:
             return OptionsStrategyAnalyzer(pos1, pos2, is_close)
         else:
             return FutureOptionStrategyAnalyzer(pos1, pos2, is_close)
@@ -89,7 +89,7 @@ class FuturesStrategyAnalyzer(StrategyAnalyzer):
         """期货跨期"""
         criteria = (
             self.exchange in (Exchange.CZCE, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['variety'] == self.pos2['variety'] and
+            self.pos1['variety'] is self.pos2['variety'] and
             self.pos1['code_original'] != self.pos2['code_original']
         )
         if criteria:
@@ -102,7 +102,7 @@ class FuturesStrategyAnalyzer(StrategyAnalyzer):
         """期货跨品种"""
         criteria = (
             self.exchange in (Exchange.CZCE, Exchange.DCE) and
-            self.pos1['variety'] != self.pos2['variety'] and
+            self.pos1['variety'] is not self.pos2['variety'] and
             FutureVariety.is_commodity_pair(self.pos1['variety'], self.pos2['variety'])
         )
         if criteria:
@@ -117,17 +117,17 @@ class OptionsStrategyAnalyzer(StrategyAnalyzer):
         criteria_public = (
             self.pos1['option_mark_code'] == self.pos2['option_mark_code'] and
             self.pos1['last_tradedate'] == self.pos2['last_tradedate'] and
-            'short' in (self.pos1['long_short'], self.pos2['long_short'])
+            'short' in (self.pos1['long_short'], self.pos2['long_short'])    # 至少一空头持仓
         )
         if criteria_public:
             if self.pos1['long_short'] == 'short' and self.pos2['long_short'] == 'long':
-                self.pos1, self.pos2 = self.pos2, self.pos1
+                self.pos1, self.pos2 = self.pos2, self.pos1    # 若一多一空, 则保证后者为空
             elif (
                 self.pos1['long_short'] == self.pos2['long_short'] and
                 self.pos1['call_put'] == 'call' and
                 self.pos2['call_put'] == 'put'
             ):
-                self.pos1, self.pos2 = self.pos2, self.pos1
+                self.pos1, self.pos2 = self.pos2, self.pos1    # 空头一call一put, 保证后者为call
             analysis_funcs = [
                 self._is_bull_call_spread(),
                 self._is_bear_call_spread(),
@@ -285,7 +285,7 @@ class OptionsStrategyAnalyzer(StrategyAnalyzer):
 
 class FutureOptionStrategyAnalyzer(StrategyAnalyzer):
     def analyze(self) -> dict:
-        if self.pos1['type'] == PositionType.Option and self.pos2['type'] == PositionType.Future:
+        if self.pos1['type'] is PositionType.Option and self.pos2['type'] is PositionType.Future:
             self.pos1, self.pos2 = self.pos2, self.pos1
         criteria_public = (
             self.pos2['option_mark_code'] == self.pos1['code_original']
@@ -337,7 +337,7 @@ class FutureOptionStrategyAnalyzer(StrategyAnalyzer):
     def _is_protective_call(self) -> bool:
         """看涨期权多头 + 期货空头"""
         criteria = (
-            self.exchange == Exchange.DCE and
+            self.exchange is Exchange.DCE and
             self.pos1['long_short'] == 'short' and
             self.pos2['long_short'] == 'long' and
             self.pos2['call_put'] == 'call'
@@ -351,7 +351,7 @@ class FutureOptionStrategyAnalyzer(StrategyAnalyzer):
     def _is_protective_put(self) -> bool:
         """看跌期权多头 + 期货多头"""
         criteria = (
-            self.exchange == Exchange.DCE and
+            self.exchange is Exchange.DCE and
             self.pos1['long_short'] == 'long' and
             self.pos2['long_short'] == 'long' and
             self.pos2['call_put'] == 'put'
