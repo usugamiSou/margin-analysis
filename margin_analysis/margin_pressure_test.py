@@ -36,10 +36,9 @@ class MarginMonitor:
         return holding
 
     def _get_cov_cholesky(self):
-        varieties = self.holding_separated['variety'].unique()
-        n_variety = len(varieties)
-        temp = self.cov.loc[varieties, varieties]
-        temp = temp.values.astype(float)
+        # TODO: holding['variety'].unique() ?, 全持仓中出现过的标的
+        n_variety = len(self.cov)
+        temp = self.cov.values[:, 1:].astype(float)
         vol_vec = np.diag(temp)
         corr_matrix = (np.triu(temp) + np.triu(temp).T
                        - 2*np.diag(np.diag(temp)) + np.eye(n_variety))
@@ -54,6 +53,7 @@ class MarginMonitor:
         if seed:
             np.random.seed(seed)
         Z = np.random.standard_normal((self.n_step, n_variety, n_path))
+        # TODO: for etf and index, r-q!=0
         r_path = -0.5 * vol_vec[None, :, None]**2 * self.dt + L @ Z * np.sqrt(self.dt)
         return r_path
 
@@ -73,24 +73,31 @@ class MarginMonitor:
                 for step in range(n_step):
                     price *= np.exp(r[step, :])
                     pnl[step, :] += (price - pos['pv']) * quantity_dir
-                    margin_pos = MarginCalculator.calc_margin_change(pos, price)    # TODO: MarginCalculator
+                    calc_margin_vec = np.vectorize(MarginCalculator.calc_margin_change,
+                                                   excluded=['pos'])    # TODO
+                    margin_pos = calc_margin_vec(pos, price)
                     margin += margin_pos * pos['quantity']
             elif pos['type'] == PositionType.Option:
                 s = np.full(n_path, fill_value=pos['s'])
                 for step in range(n_step):
                     s *= np.exp(r[step, :])
-                    price = self.BSM(pos, s)    # TODO: self.BSM()
+                    '''
+                    Delta、Gamma近似估计期权价格的变化
+                        params: delta, gamma
+                    也可以通过实现定价公式来计算 (欧式、美式)
+                        params: r, q, sigma, T
+                    '''
+                    price += (s - pos['s']) * pos['delta'] + 0.5 * (s - pos['s'])**2 * pos['gamma']
                     pnl[step, :] += (price - pos['pv']) * quantity_dir
-                    margin_pos = MarginCalculator.calc_margin_change(pos, price)    # TODO: MarginCalculator
+                    calc_margin_vec = np.vectorize(MarginCalculator.calc_margin_change,
+                                                   excluded=['pos'])    # TODO
+                    margin_pos = calc_margin_vec(pos, price)
                     margin += margin_pos * pos['quantity']
         return pnl, margin
 
-    def BSM(pos, s):
-        return pos['pv'] * s / pos['s']    # TODO
-
-
     def run(self):
         out_df = pd.DataFrame()
+        r_path = self.gen_path(n_path=10000, seed=20)
         for account, account_info in self.margin_account.iterrows():
             equity_temp = account_info['Equity']
             risk_target = account_info['RiskRatioTarget']
@@ -100,16 +107,16 @@ class MarginMonitor:
                 continue
             self.holding_separated = holding_account.copy()
             supplement = self.supplement.loc[account]
-            r_path = self.gen_path(n_path=10000, seed=20)
+            
             pnl, margin = self.calc_path(r_path)
-            equity = equity_temp + pnl + supplement.values.cumsum()    # TODO: check
+            equity = equity_temp + pnl + supplement.values.cumsum()    # TODO: check shape
             risk_ratio = margin / equity
             risk_ratio_var = []
             for step in range(self.n_step):
                 var = np.percentile(risk_ratio[:, step], self.p)
                 risk_ratio_var.append(var)
             risk_ratio_var_df = pd.DataFrame(risk_ratio_var,
-                                             columns=[f'T+{i}' for i in range(step)])    # TODO: check
+                                             columns=[f'T+{i}' for i in range(step)])    # TODO: check shape
             risk_ratio_var_df['AccountName'] = account
             out_df = out_df.append(risk_ratio_var_df)
         out_df = out_df.dropna()

@@ -18,15 +18,46 @@ class PositionType(Enum):
     Stock = auto()
 
 @unique
+class OptionVariety(Enum):
+    ETF = auto()
+    Index = auto()
+    Commodity = auto()
+
+@unique
 class FutureVariety(Enum):
     # 中国金融期货交易所
     IF = auto()
     IC = auto()
     IM = auto()
     IH = auto()
+    Index = auto()    # 期权标的, 非期货
 
     # 上海期货交易所
-    # TODO
+    CU = auto()    # 铜
+    BC = auto()    # 铜(BC)
+    AL = auto()    # 铝
+    ZN = auto()    # 锌
+    PB = auto()    # 铅
+    NI = auto()    # 镍
+    SN = auto()    # 锡
+    AO = auto()    # 氧化铝
+    AD = auto()    # 铸造铝合金
+    AU = auto()    # 黄金
+    AG = auto()    # 白银
+    RB = auto()    # 螺纹钢
+    WR = auto()    # 线材
+    HC = auto()    # 热轧卷板
+    SS = auto()    # 不锈钢
+    SC = auto()    # 原油
+    LU = auto()    # 低硫燃料油
+    FU = auto()    # 燃料油
+    BU = auto()    # 石油沥青
+    BR = auto()    # 合成橡胶
+    RU = auto()    # 天然橡胶
+    NR = auto()    # 20号胶
+    SP = auto()    # 纸浆
+    OP = auto()    # 胶版印刷纸
+    EC = auto()    # SCFIS欧线
 
     # 大连商品交易所
     A = auto()    # 黄大豆1号

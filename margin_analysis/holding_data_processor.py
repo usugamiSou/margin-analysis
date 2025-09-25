@@ -8,7 +8,8 @@ class HoldingDataProcessor:
     @staticmethod
     def preprocess_holding(holding: pd.DataFrame,
                            futures_data: pd.DataFrame | list[pd.DataFrame],
-                           options_data: pd.DataFrame | list[pd.DataFrame]) -> pd.DataFrame:
+                           options_data: pd.DataFrame | list[pd.DataFrame],
+                           margin_ratio: pd.DataFrame) -> pd.DataFrame:
         """
         预处理持仓数据, 拆分多空单独持仓, 整合市场数据
 
@@ -22,8 +23,8 @@ class HoldingDataProcessor:
         holding[['exchange', 'type', 'variety']] = holding['code_original'].apply(
             lambda x: pd.Series(HoldingDataProcessor.find_position_basic_info(x)))
 
-        holding_futures = holding[holding['type'] is PositionType.Future].copy()
-        holding_options = holding[holding['type'] is PositionType.Option].copy()
+        holding_futures = holding[holding['type'] == PositionType.Future].copy()
+        holding_options = holding[holding['type'] == PositionType.Option].copy()
         if not holding_futures.empty:
             holding_futures = HoldingDataProcessor.supplement_futures_data(
                 holding_futures, futures_data)
@@ -43,9 +44,8 @@ class HoldingDataProcessor:
         holding_short['code'] = holding_long['code_original'] + '.S'
         holding = pd.concat([holding_long, holding_short], ignore_index=True)
 
-        holding['margin'] = 100000    # TODO: MarginCalculator
-        holding['market_value'] = (holding['pv'] * holding['quantity']
-                                    * holding['long_short'].map({'long': 1, 'short': -1}))
+        holding['margin'] = holding.apply(
+            lambda x: MarginCalculator(x, margin_ratio).calc(), axis=1)
         return holding
 
     @staticmethod
@@ -89,21 +89,17 @@ class HoldingDataProcessor:
                 match_future = re.match(r'^(IF|IC|IM|IH)[0-9]{4}$', code)
                 if match_future:
                     position_type = PositionType.Future
-                    variety = FutureVariety(match_future.group(1))
+                    variety = FutureVariety[match_future.group(1)]
                 else:
                     match_option = re.match(r'^(IO|MO|HO)[0-9]{4}.+$', code)
                     if match_option:
                         position_type = PositionType.Option
-                        variety = {
-                            'IO': FutureVariety.IF,
-                            'MO': FutureVariety.IM,
-                            'HO': FutureVariety.IH
-                        }.get(match_option.group(1))
+                        variety = FutureVariety.Index
 
             case 'XSHG' | 'SH':
                 exchange = Exchange.SH
                 match_option1 = re.match(r'^1[0-9]{7}$', code)
-                match_option2 = re.match(r'^[0-9]{6}(C|P)[0-9]{4}M[0-9]+.$', code)
+                match_option2 = re.match(r'^51[0-9]{4}(C|P)[0-9]{4}M[0-9]+.$', code)
                 if match_option1 or match_option2:
                     position_type = PositionType.Option
                     variety = FutureVariety.ETF
@@ -111,7 +107,7 @@ class HoldingDataProcessor:
             case 'XSHE' | 'SZ':
                 exchange = Exchange.SZ
                 match_option1 = re.match(r'^9[0-9]{7}$', code)
-                match_option2 = re.match(r'^[0-9]{6}(C|P)[0-9]{4}M[0-9]+.$', code)
+                match_option2 = re.match(r'^15[0-9]{4}(C|P)[0-9]{4}M[0-9]+.$', code)
                 if match_option or match_option2:
                     position_type = PositionType.Option
                     variety = FutureVariety.ETF

@@ -30,7 +30,7 @@ class MarginOptimizer:
             temp[['type', 'margin', 'margin_saving']] = temp.apply(
                 lambda x: pd.Series(self._analyze_strategy(x, pos)), axis=1)
             temp = temp[['code', 'type', 'margin', 'margin_saving']]
-            temp = temp[temp['type'] is not StrategyType.Invalid]
+            temp = temp[temp['type'] != StrategyType.Invalid]
             temp = temp[temp['margin_saving'] > 0]
             temp['code'] = temp['code'].apply(lambda x: (pos['code'], x))
             avail_strats = pd.concat([avail_strats, temp], ignore_index=True)
@@ -84,36 +84,36 @@ class MarginOptimizer:
 
     def _handle_CFE(self) -> pd.DataFrame:
         """中金所: 期货对锁、跨期、跨品种, 单向大边保证金"""
-        holding_futures = self.holding_separated[self.holding_separated['type'] is PositionType.Future].copy()
+        holding_futures = self.holding_separated[self.holding_separated['type'] == PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
                     lambda x: x['quantity'] * x['margin'], axis=1)
             larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
             self.holding_separated.loc[(
-                (self.holding_separated['type'] is PositionType.Future) &
+                (self.holding_separated['type'] == PositionType.Future) &
                 (self.holding_separated['long_short'] != larger_side)
         ), 'margin'] = 0
         return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
 
     def _handle_SHFE(self) -> pd.DataFrame:
         """上期所: 期货对锁、跨期, 单向大边保证金"""
-        holding_futures = self.holding_separated[self.holding_separated['type'] is PositionType.Future].copy()
+        holding_futures = self.holding_separated[self.holding_separated['type'] == PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
                     lambda x: x['quantity'] * x['margin'], axis=1)
             for variety, holding_variety in holding_futures.groupby('variety'):
                     larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
                     self.holding_separated.loc[(
-                        (self.holding_separated['type'] is PositionType.Future) &
-                        (self.holding_separated['variety'] is variety) &
+                        (self.holding_separated['type'] == PositionType.Future) &
+                        (self.holding_separated['variety'] == variety) &
                         (self.holding_separated['long_short'] != larger_side)
                     ), 'margin'] = 0
         return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
 
     def _handle_each_account(self, exchange: Exchange) -> pd.DataFrame:
-        if exchange is Exchange.CFE:
+        if exchange == Exchange.CFE:
             return self._handle_CFE()
-        elif exchange is Exchange.SHFE:
+        elif exchange == Exchange.SHFE:
             return self._handle_SHFE()
         else:
             return self._optimize()
