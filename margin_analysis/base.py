@@ -4,8 +4,8 @@ from enum import Enum, unique, auto
 @unique
 class Exchange(Enum):
     CFE = auto()
-    SH = auto()
-    SZ = auto()
+    SSE = auto()
+    SZSE = auto()
     SHFE = auto()
     DCE = auto()
     CZCE = auto()
@@ -25,14 +25,16 @@ class OptionVariety(Enum):
 
 @unique
 class FutureVariety(Enum):
-    # 中国金融期货交易所
+    # CFE
     IF = auto()
     IC = auto()
     IM = auto()
     IH = auto()
-    Index = auto()    # 期权标的, 非期货
+    IO = auto()
+    MO = auto()
+    HO = auto()
 
-    # 上海期货交易所
+    # SHFE
     CU = auto()    # 铜
     BC = auto()    # 铜(BC)
     AL = auto()    # 铝
@@ -59,7 +61,7 @@ class FutureVariety(Enum):
     OP = auto()    # 胶版印刷纸
     EC = auto()    # SCFIS欧线
 
-    # 大连商品交易所
+    # DCE
     A = auto()    # 黄大豆1号
     B = auto()    # 黄大豆2号
     M = auto()    # 豆粕
@@ -84,14 +86,14 @@ class FutureVariety(Enum):
     PG = auto()    # 液化石油气
     BZ = auto()    # 纯苯
 
-    # 郑州商品交易所
+    # CZCE
 
     # TODO
 
-    # 广州期货交易所
+    # GFEX
     # TODO
 
-    # 上海证券交易所、深圳证券交易所
+    # SSE, SZSE
     ETF = auto()    # 期权标的, 非期货
     
     @classmethod
@@ -101,7 +103,7 @@ class FutureVariety(Enum):
 
 
 FutureVariety._commodity_pairs = (
-        # 大连商品交易所
+        # DCE
         (FutureVariety.A, FutureVariety.B),
         (FutureVariety.A, FutureVariety.M),
         (FutureVariety.B, FutureVariety.M),
@@ -126,6 +128,6 @@ FutureVariety._commodity_pairs = (
         (FutureVariety.EG, FutureVariety.PG),
         (FutureVariety.EB, FutureVariety.PG),
 
-        # 郑州商品交易所
+        # CZCE
         # TODO
     )

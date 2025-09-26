@@ -21,7 +21,7 @@ class MarginOptimizer:
         self.holding_separated = self.holding_separated[
             self.holding_separated['type'].isin((PositionType.Future, PositionType.Option))
             ].reset_index(drop=True)
-        avail_strats = pd.DataFrame(columns=['code', 'type', 'margin', 'margin_saving'])
+        avail_strats = pd.DataFrame(columns=['code_dir', 'type', 'margin', 'margin_saving'])
 
         for i, pos in self.holding_separated.iterrows():
             if i == len(self.holding_separated) - 1:
@@ -29,18 +29,23 @@ class MarginOptimizer:
             temp = self.holding_separated[i+1:].copy()
             temp[['type', 'margin', 'margin_saving']] = temp.apply(
                 lambda x: pd.Series(self._analyze_strategy(x, pos)), axis=1)
-            temp = temp[['code', 'type', 'margin', 'margin_saving']]
-            temp = temp[temp['type'] != StrategyType.Invalid]
-            temp = temp[temp['margin_saving'] > 0]
-            temp['code'] = temp['code'].apply(lambda x: (pos['code'], x))
-            avail_strats = pd.concat([avail_strats, temp], ignore_index=True)
+            temp = temp[['code_dir', 'type', 'margin', 'margin_saving']]
+            temp = temp[
+                (temp['type'] != StrategyType.Invalid) &
+                (temp['margin_saving'] > 0)
+            ]
+            if temp.empty:
+                continue
+            temp['code_dir'] = temp['code_dir'].apply(lambda x: (pos['code_dir'], x))
+            dfs = [df for df in [avail_strats, temp] if not df.empty]
+            avail_strats = pd.concat(dfs, ignore_index=True)
         return avail_strats
 
     def _optimize(self) -> pd.DataFrame:
         """单个账号持仓的组合保证金优化"""
         avail_strats = self._find_available_strategies()
         if avail_strats.empty:
-            return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
+            return self.holding_separated[['code_dir', 'type', 'quantity', 'margin']].copy()
 
         '''
         MILP:
@@ -54,9 +59,9 @@ class MarginOptimizer:
         ub = self.holding_separated['quantity'].values
         lb = np.zeros_like(ub)
         A = np.zeros([len(self.holding_separated), len(avail_strats)])
-        for j, (pos1, pos2) in enumerate(avail_strats['code']):
-            i1 = self.holding_separated.index[self.holding_separated['code'] == pos1][0]
-            i2 = self.holding_separated.index[self.holding_separated['code'] == pos2][0]
+        for j, (pos1, pos2) in enumerate(avail_strats['code_dir']):
+            i1 = self.holding_separated.index[self.holding_separated['code_dir'] == pos1][0]
+            i2 = self.holding_separated.index[self.holding_separated['code_dir'] == pos2][0]
             A[i1, j] = 1
             A[i2, j] = 1
         constraints = LinearConstraint(A, lb, ub)
@@ -64,23 +69,16 @@ class MarginOptimizer:
         res = milp(c=-c, constraints=constraints, integrality=integrality)
 
         if res.success:
-            selected_strats = pd.DataFrame({
-                'code': avail_strats['code'],
-                'type': avail_strats['type'],
-                'quantity': res.x,
-                'margin': avail_strats['margin']
-            })
-            selected_strats = selected_strats.loc[selected_strats['quantity'] > 0].reset_index(drop=True)
-            remaining_pos = pd.DataFrame({
-                'code': self.holding_separated['code'],
-                'type': self.holding_separated['type'],
-                'quantity': ub - A @ res.x,
-                'margin': self.holding_separated['margin']
-            })
-            remaining_pos = remaining_pos.loc[remaining_pos['quantity'] > 0].reset_index(drop=True)
-            return pd.concat([remaining_pos, selected_strats], ignore_index=True)
+            selected_strats = avail_strats[['code_dir', 'type', 'margin']].copy()
+            selected_strats['quantity'] = res.x
+            selected_strats = selected_strats[selected_strats['quantity'] > 0].reset_index(drop=True)
+            remaining_pos = self.holding_separated[['code_dir', 'type', 'margin']].copy()
+            remaining_pos['quantity'] = ub - A @ res.x
+            remaining_pos = remaining_pos[remaining_pos['quantity'] > 0].reset_index(drop=True)
+            dfs = [df for df in [remaining_pos, selected_strats] if not df.empty]
+            return pd.concat(dfs, ignore_index=True)
         else:
-            raise ValueError("Optimization failed.")
+            raise ValueError('Optimization failed.')
 
     def _handle_CFE(self) -> pd.DataFrame:
         """中金所: 期货对锁、跨期、跨品种, 单向大边保证金"""
@@ -93,7 +91,7 @@ class MarginOptimizer:
                 (self.holding_separated['type'] == PositionType.Future) &
                 (self.holding_separated['long_short'] != larger_side)
         ), 'margin'] = 0
-        return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
+        return self.holding_separated[['code_dir', 'type', 'quantity', 'margin']].copy()
 
     def _handle_SHFE(self) -> pd.DataFrame:
         """上期所: 期货对锁、跨期, 单向大边保证金"""
@@ -108,7 +106,7 @@ class MarginOptimizer:
                         (self.holding_separated['variety'] == variety) &
                         (self.holding_separated['long_short'] != larger_side)
                     ), 'margin'] = 0
-        return self.holding_separated[['code', 'type', 'quantity', 'margin']].copy()
+        return self.holding_separated[['code_dir', 'type', 'quantity', 'margin']].copy()
 
     def _handle_each_account(self, exchange: Exchange) -> pd.DataFrame:
         if exchange == Exchange.CFE:
@@ -131,5 +129,9 @@ class MarginOptimizer:
             optimization_result = self._handle_each_account(exchange)
             optimization_result['exchange'] = exchange.name
             optimization_result['account'] = account
+            optimization_result['type'] = optimization_result['type'].apply(
+                lambda x: x.name)
+            optimization_result = optimization_result[[
+                'exchange', 'account', 'code_dir', 'type', 'quantity', 'margin']]
             dfs.append(optimization_result)
         return pd.concat(dfs, ignore_index=True)

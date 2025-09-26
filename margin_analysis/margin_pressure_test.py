@@ -5,35 +5,17 @@ from margin_calculator import MarginCalculator
 
 
 class MarginMonitor:
-    def __init__(self, cal_date: str, params_file: str,
-                 account_file: str, holding_file: str):
+    def __init__(self, cal_date: str, params: tuple[pd.DataFrame],
+                 margin_account: pd.DataFrame, holding: pd.DataFrame):
         self.target_risk_ratio = 0.95
         self.p = 90    # VaR percentile
         self.dt = 1 / 252
         self.n_step = 2
         self.cal_date = cal_date
-        self.margin_ratio, self.supplement, self.cov = self._load_params(params_file)
-        self.margin_account = self._load_accounts(account_file)
-        self.holding = self._load_holdings(holding_file)
+        self.margin_ratio, self.supplement, self.cov = params
+        self.margin_account = self._load_accounts(margin_account)
+        self.holding = self._load_holdings(holding)
         self.holding_separated = self.holding
-
-    def _load_params(self, params_file: str):
-        margin_ratio = pd.read_excel(params_file, sheet_name='marginRatio').set_index('Variety')
-        supplement = pd.read_excel(params_file, sheet_name='supplement').set_index('AccountName')
-        cov = pd.read_excel(params_file, sheet_name='cov').set_index('Variety')
-        return margin_ratio, supplement, cov
-
-    def _load_account(self, account_file: str):
-        margin_account = pd.read_excel(account_file).dropna()
-        margin_account = margin_account[['资产单元名称', '账户权益']]
-        margin_account.rename(columns={'资产单元名称': 'account', '账户权益': 'equity'}, inplace=True)
-        margin_account['RiskRatioTarget'] = self.target_risk_ratio
-        margin_account.set_index('account')
-        return margin_account
-
-    def _load_holding(self, holding_file: str):
-        holding = pd.read_csv(holding_file, encoding='GB2312')
-        return holding
 
     def _get_cov_cholesky(self):
         # TODO: holding['variety'].unique() ?, 全持仓中出现过的标的
