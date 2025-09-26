@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from base import PositionType, FutureVariety, Exchange
+from base import PositionType, Exchange
 
 
 class MarginCalculator:
@@ -8,7 +8,7 @@ class MarginCalculator:
         for key, value in pos.dropna().items():
             setattr(self, key, value)
         variety = self.variety.name
-        if variety not in ('ETF', 'Index'):
+        if variety != 'ETF':
             self.margin_ratio = margin_ratio_df.loc[variety, 'MarginRatio']
 
     def calc(self):
@@ -17,28 +17,46 @@ class MarginCalculator:
         elif self.type == PositionType.Option:
             return self.calc_option()
 
-    def calc_future(self, pv=None):
-        # self.pv = self.pv if pv is None else pv
-        return self.pv * self.contract_unit * self.margin_ratio
+    def calc_future(self, close_price=None):
+        # self.close_price = self.close_price if close_price is None else close_price
+        return self.close_price * self.multiplier * self.margin_ratio
 
-    def calc_option(self, s=None):
+    def calc_option(self, udl_price=None):
         if self.long_short == 'long':
             return 0
-        # self.s = self.s if s is None else s
-        if self.exchange in (Exchange.SH, Exchange.SZ):
+        # self.udl_price = self.udl_price if udl_price is None else udl_price
+        if self.exchange in (Exchange.SSE, Exchange.SZSE):
             if self.call_put == 'call':
-                otm = max(self.strike_price - self.s, 0)
-                return (self.pv + max(0.12 * self.s - otm, 0.07 * self.s)) * self.multiplier
+                otm = max(self.strike_price - self.udl_price, 0)
+                return self.multiplier * (self.close_price + max(
+                    0.12 * self.udl_price - otm,
+                    0.07 * self.udl_price))
             else:
-                otm = max(self.s - self.strike_price, 0)
-                return min(self.pv + max(0.12 * self.s - otm, 0.07 * self.strike_price),
-                           self.strike_price) * self.multiplier
+                otm = max(self.udl_price - self.strike_price, 0)
+                return self.multiplier * min(
+                    self.close_price + max(
+                        0.12 * self.udl_price - otm,
+                        0.07 * self.strike_price),
+                    self.strike_price)
+
         elif self.exchange == Exchange.CFE:
-            pass
-        else:
-            future_margin = self.s * self.contract_unit * self.margin_ratio
+            min_safety_factor = 0.5
             if self.call_put == 'call':
-                otm = max(self.strike_price - self.s, 0) * self.contract_unit
+                otm = max(self.strike_price - self.udl_price, 0)
+                return self.multiplier * (self.close_price + max(
+                    self.udl_price * self.margin_ratio - otm,
+                    min_safety_factor * self.udl_price * self.margin_ratio))
             else:
-                otm = max(self.s - self.strike_price, 0) * self.contract_unit
-            return (self.pv * self.contract_unit + future_margin - 0.5 * min(otm, future_margin))
+                otm = max(self.udl_price - self.strike_price, 0)
+                return self.multiplier * (self.close_price + max(
+                    self.udl_price * self.margin_ratio - otm,
+                    min_safety_factor * self.strike_price * self.margin_ratio))
+
+        else:
+            future_margin = self.udl_price * self.margin_ratio
+            if self.call_put == 'call':
+                otm = max(self.strike_price - self.udl_price, 0)
+            else:
+                otm = max(self.udl_price - self.strike_price, 0)
+            return self.multiplier * (
+                self.close_price + future_margin - 0.5 * min(otm, future_margin))
