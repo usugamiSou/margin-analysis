@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import milp, LinearConstraint
 from base import Exchange, PositionType
-from combination_strategies import StrategyType, StrategyAnalyzer
+from strategies import *
 
 
 class MarginOptimizer:
@@ -11,10 +11,22 @@ class MarginOptimizer:
         self.holding_separated = self.holding
         self.is_close = is_close
 
-    def _analyze_strategy(self, pos: pd.Series, pos_given: pd.Series) -> dict:
+    def _analyze_strategy(self, anchor_pos: pd.Series, pos: pd.Series) -> dict:
         """分析两手持仓可构成的组合策略, 并计算其组合保证金"""
-        analyzer = StrategyAnalyzer.create_analyzer(pos, pos_given, self.is_close)
-        return analyzer.analyze()
+        analysis = {
+            'type': None,
+            'margin': None,
+            'margin_saving': None,
+        }
+        analyzer = StrategyAnalyzerFactory.create(anchor_pos, pos, self.is_close)
+        strategy = analyzer.analyze()
+        if strategy:
+            analysis.update({
+                'type': strategy.type,
+                'margin': strategy.margin,
+                'margin_saving': strategy.margin_saving,
+            })
+        return analysis
 
     def _find_available_strategies(self) -> pd.DataFrame:
         """寻找某个账号持仓的所有可行组合策略"""
@@ -23,20 +35,19 @@ class MarginOptimizer:
             ].reset_index(drop=True)
         avail_strats = pd.DataFrame(columns=['code_dir', 'type', 'margin', 'margin_saving'])
 
-        for i, pos in self.holding_separated.iterrows():
+        for i, anchor_pos in self.holding_separated.iterrows():
             if i == len(self.holding_separated) - 1:
                 break
             temp = self.holding_separated[i+1:].copy()
             temp[['type', 'margin', 'margin_saving']] = temp.apply(
-                lambda x: pd.Series(self._analyze_strategy(x, pos)), axis=1)
-            temp = temp[['code_dir', 'type', 'margin', 'margin_saving']]
-            temp = temp[
-                (temp['type'] != StrategyType.Invalid) &
-                (temp['margin_saving'] > 0)
-            ]
+                lambda pos: pd.Series(self._analyze_strategy(anchor_pos, pos).values()), axis=1
+            )
+            temp.dropna(subset=['type'], inplace=True)
+            temp = temp[temp['margin_saving'] > 0].copy()
             if temp.empty:
                 continue
-            temp['code_dir'] = temp['code_dir'].apply(lambda x: (pos['code_dir'], x))
+            temp['code_dir'] = temp['code_dir'].apply(lambda x: (anchor_pos['code_dir'], x))
+            temp = temp[['code_dir', 'type', 'margin', 'margin_saving']]
             dfs = [df for df in [avail_strats, temp] if not df.empty]
             avail_strats = pd.concat(dfs, ignore_index=True)
         return avail_strats
@@ -54,7 +65,6 @@ class MarginOptimizer:
             Subject to: lb <= A * x <= ub        # 持仓数量约束
                         x : Non-negative integers
         '''
-
         c = avail_strats['margin_saving'].values
         ub = self.holding_separated['quantity'].values
         lb = np.zeros_like(ub)
@@ -75,13 +85,14 @@ class MarginOptimizer:
             remaining_pos = self.holding_separated[['code_dir', 'type', 'margin']].copy()
             remaining_pos['quantity'] = ub - A @ res.x
             remaining_pos = remaining_pos[remaining_pos['quantity'] > 0].reset_index(drop=True)
+            remaining_pos['type'] = remaining_pos['type'].apply(lambda x: x.name)
             dfs = [df for df in [remaining_pos, selected_strats] if not df.empty]
             return pd.concat(dfs, ignore_index=True)
         else:
             raise ValueError('Optimization failed.')
 
-    def _handle_CFE(self) -> pd.DataFrame:
-        """中金所: 期货对锁、跨期、跨品种, 单向大边保证金"""
+    def _process_CFE(self) -> pd.DataFrame:
+        """处理中金所账号持仓 - 单向大边保证金 (期货对锁、跨期、跨品种)"""
         holding_futures = self.holding_separated[self.holding_separated['type'] == PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
@@ -90,11 +101,12 @@ class MarginOptimizer:
             self.holding_separated.loc[(
                 (self.holding_separated['type'] == PositionType.Future) &
                 (self.holding_separated['long_short'] != larger_side)
-        ), 'margin'] = 0
+            ), 'margin'] = 0
+        self.holding_separated['type'] = self.holding_separated['type'].apply(lambda x: x.name)
         return self.holding_separated[['code_dir', 'type', 'quantity', 'margin']].copy()
 
-    def _handle_SHFE(self) -> pd.DataFrame:
-        """上期所: 期货对锁、跨期, 单向大边保证金"""
+    def _process_SHFE(self) -> pd.DataFrame:
+        """处理上期所账号持仓 - 单向大边保证金 (期货对锁、跨期)"""
         holding_futures = self.holding_separated[self.holding_separated['type'] == PositionType.Future].copy()
         if not holding_futures.empty:
             holding_futures['total_margin'] = holding_futures.apply(
@@ -106,13 +118,15 @@ class MarginOptimizer:
                         (self.holding_separated['variety'] == variety) &
                         (self.holding_separated['long_short'] != larger_side)
                     ), 'margin'] = 0
+        self.holding_separated['type'] = self.holding_separated['type'].apply(lambda x: x.name)
         return self.holding_separated[['code_dir', 'type', 'quantity', 'margin']].copy()
 
-    def _handle_each_account(self, exchange: Exchange) -> pd.DataFrame:
+    def _process_each_account(self, exchange: Exchange) -> pd.DataFrame:
+        """按交易所处理单个账号持仓"""
         if exchange == Exchange.CFE:
-            return self._handle_CFE()
+            return self._process_CFE()
         elif exchange == Exchange.SHFE:
-            return self._handle_SHFE()
+            return self._process_SHFE()
         else:
             return self._optimize()
     
@@ -126,11 +140,10 @@ class MarginOptimizer:
             self.holding_separated = holding_account.copy()
             self.holding_separated['exchange'] = exchange
             self.holding_separated.reset_index(drop=True, inplace=True)
-            optimization_result = self._handle_each_account(exchange)
+            optimization_result = self._process_each_account(exchange)
             optimization_result['exchange'] = exchange.name
             optimization_result['account'] = account
-            optimization_result['type'] = optimization_result['type'].apply(
-                lambda x: x.name)
+            optimization_result['type'] = optimization_result['type']
             optimization_result = optimization_result[[
                 'exchange', 'account', 'code_dir', 'type', 'quantity', 'margin']]
             dfs.append(optimization_result)
