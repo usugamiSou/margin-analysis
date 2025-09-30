@@ -1,363 +1,438 @@
-from enum import Enum, unique, auto
+from abc import ABC, abstractmethod
+from functools import cached_property
 import pandas as pd
-from base import Exchange, PositionType, FutureVariety
+from base import Exchange, PositionType, Variety
 
 
-@unique
-class StrategyType(Enum):
-    # Future + Future
-    FutureLockPosition = auto()    # 期货对锁
-    CalendarSpread = auto()    # 期货跨期
-    InterCommoditySpread = auto()    # 期货跨品种
-    # Option + Option
-    BullCallSpread = auto()    # 牛市看涨价差
-    BearCallSpread = auto()    # 熊市看涨价差
-    BullPutSpread = auto()    # 牛市看跌价差
-    BearPutSpread = auto()    # 熊市看跌价差
-    Straddle = auto()    # 跨式
-    Strangle = auto()    # 宽跨式
-    OptionLockPosition = auto()    # 期权对锁
-    AutoHedging = auto()    # 期权自动对冲
-    # Future + Option
-    CoveredCall = auto()    # 看涨期权空头 + 期货多头
-    CoveredPut = auto()    # 看跌期权空头 + 期货空头
-    ProtectiveCall = auto()    # 看涨期权多头 + 期货空头
-    ProtectivePut = auto()    # 看跌期权多头 + 期货多头
-    # Invalid
-    Invalid = auto()
+class Strategy(ABC):
+    """组合策略基类"""
+    def __init__(self, pos1: pd.Series, pos2: pd.Series):
+        self._pos1, self._pos2 = self.modify_positions(pos1, pos2)
+
+    @staticmethod
+    @abstractmethod
+    def modify_positions(pos1: pd.Series, pos2: pd.Series) -> tuple[pd.Series, pd.Series]:
+        """调整两笔持仓头寸的顺序"""
+        pass
+
+    @staticmethod
+    @abstractmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        """两笔持仓头寸是否能构成该组合策略"""
+        pass
+
+    @property
+    def pos1(self) -> str:
+        """第一笔持仓头寸"""
+        return self._pos1['code_dir']
+
+    @property
+    def pos2(self) -> str:
+        """第二笔持仓头寸"""
+        return self._pos2['code_dir']
+
+    @property
+    def type(self) -> str:
+        """组合策略类型"""
+        return self.__class__.__name__
+
+    @cached_property
+    @abstractmethod
+    def margin(self) -> float:
+        """组合保证金"""
+        pass
+
+    @cached_property
+    def margin_saving(self) -> float:
+        """组合所节省的保证金"""
+        return self._pos1['margin'] + self._pos2['margin'] - self.margin
 
 
-class StrategyAnalyzer:
-    """分析两手持仓可构成的组合策略, 并计算其组合保证金"""
+class FuturesStrategy(Strategy):
+    """期货组合基类"""
+    @staticmethod
+    def modify_positions(pos1: pd.Series, pos2: pd.Series) -> tuple[pd.Series, pd.Series]:
+        return pos1, pos2
+
+
+class OptionsStrategy(Strategy):
+    """期权组合基类"""
+    @staticmethod
+    def modify_positions(pos1: pd.Series, pos2: pd.Series) -> tuple[pd.Series, pd.Series]:
+        if (
+            pos1['long_short'] == 'short' and
+            pos2['long_short'] == 'long'
+        ):
+            return pos2, pos1    # 若一多一空, 则保证后者为空
+        elif (
+            pos1['long_short'] == pos2['long_short'] and
+            pos1['call_put'] == 'call' and
+            pos2['call_put'] == 'put'
+        ):
+            return pos2, pos1    # 空头一看涨一看跌, 保证后者为看涨
+        else:
+            return pos1, pos2
+
+
+class FutureOptionStrategy(Strategy):
+    """期货期权组合基类"""
+    @staticmethod
+    def modify_positions(pos1: pd.Series, pos2: pd.Series) -> tuple[pd.Series, pd.Series]:
+        if pos1['type'] == PositionType.Option:
+            return pos2, pos1    # 保证pos1为期货, pos2为期权
+        else:
+            return pos1, pos2
+
+
+class FutureLockPosition(FuturesStrategy):
+    """期货对锁组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['code'] and
+            pos1['long_short'] != pos2['long_short'] and
+            exchange in {Exchange.CZCE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return max(self._pos1['margin'], self._pos2['margin'])
+
+
+class CalendarSpread(FuturesStrategy):
+    """期货跨期组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['variety'] == pos2['variety'] and
+            pos1['code'] != pos2['code'] and
+            pos1['long_short'] != pos2['long_short'] and
+            exchange in {Exchange.CZCE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return max(self._pos1['margin'], self._pos2['margin'])
+
+
+class InterCommoditySpread(FuturesStrategy):
+    """期货跨品种组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            Variety.is_commodity_pair(pos1['variety'], pos2['variety'], exchange) and
+            pos1['long_short'] != pos2['long_short'] and
+            exchange in {Exchange.CZCE, Exchange.DCE}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return max(self._pos1['margin'], self._pos2['margin'])
+
+
+class BullCallSpread(OptionsStrategy):
+    """牛市看涨价差组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
+            pos1['call_put'] == 'call' and
+            pos2['call_put'] == 'call' and
+            pos1['strike_price'] - pos2['strike_price'] < -1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        if self._pos1['exchange'] in {Exchange.SSE, Exchange.SZSE}:
+            return 0.0
+        else:
+            return self._pos2['margin'] * 0.2
+
+
+class BearCallSpread(OptionsStrategy):
+    """熊市看涨价差组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
+            pos1['call_put'] == 'call' and
+            pos2['call_put'] == 'call' and
+            pos1['strike_price'] - pos2['strike_price'] > 1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return (self._pos1['strike_price'] - self._pos2['strike_price']) * self._pos1['multiplier']
+
+
+class BullPutSpread(OptionsStrategy):
+    """牛市看跌价差组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
+            pos1['call_put'] == 'put' and
+            pos2['call_put'] == 'put' and
+            pos1['strike_price'] - pos2['strike_price'] < -1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return (self._pos2['strike_price'] - self._pos1['strike_price']) * self._pos2['multiplier']
+
+
+class BearPutSpread(OptionsStrategy):
+    """熊市看跌价差组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
+            pos1['call_put'] == 'put' and
+            pos2['call_put'] == 'put' and
+            pos1['strike_price'] - pos2['strike_price'] > 1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        if self._pos1['exchange'] in {Exchange.SSE, Exchange.SZSE}:
+            return 0.0
+        else:
+            return self._pos2['margin'] * 0.2
+
+
+class Straddle(OptionsStrategy):
+    """跨式组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] == 'short' and
+            pos2['long_short'] == 'short' and
+            pos1['call_put'] != pos2['call_put'] and    # pos1 看跌, pos2 看涨
+            abs(pos1['strike_price'] - pos2['strike_price']) < 1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.CZCE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self.calc_margin(self._pos1, self._pos2)
+
+    @staticmethod
+    def calc_margin(pos1: pd.Series, pos2: pd.Series) -> float:
+        if pos1['margin'] - pos2['margin'] > 1e-6:
+            pos_higher, pos_lower = pos1, pos2
+        elif pos1['margin'] - pos2['margin'] < -1e-6:
+            pos_higher, pos_lower = pos2, pos1
+        else:
+            if pos1['close_price'] - pos2['close_price'] > 1e-6:
+                pos_higher, pos_lower = pos1, pos2
+            else:
+                pos_higher, pos_lower = pos2, pos1
+        return pos_higher['margin'] + pos_lower['close_price'] * pos_lower['multiplier']
+
+
+class Strangle(OptionsStrategy):
+    """宽跨式组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['last_tradedate'] == pos2['last_tradedate'] and
+            pos1['long_short'] == 'short' and
+            pos2['long_short'] == 'short' and
+            pos1['call_put'] != pos2['call_put'] and    # pos1 看跌, pos2 看涨
+            pos1['strike_price'] - pos2['strike_price'] < -1e-6 and
+            exchange in {Exchange.SSE, Exchange.SZSE, Exchange.CZCE, Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return Straddle.calc_margin(self._pos1, self._pos2)
+
+
+class OptionLockPosition(OptionsStrategy):
+    """期权对锁组合"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['code'] and
+            pos1['long_short'] != pos2['long_short'] and
+            exchange in {Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self._pos2['margin'] * 0.2
+
+
+class AutoHedging(OptionsStrategy):
+    """期权自动对冲"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['code'] and
+            pos1['long_short'] != pos2['long_short'] and
+            exchange in {Exchange.SSE, Exchange.SZSE} and
+            is_close
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return 0.0
+
+
+class CoveredCall(FutureOptionStrategy):
+    """备兑看涨组合 (看涨期权空头 + 期货多头)"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['option_mark_code'] and
+            pos1['long_short'] == 'long' and
+            pos2['long_short'] == 'short' and
+            pos2['call_put'] == 'call' and
+            exchange in {Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self._pos1['margin'] + self._pos2['close_price'] * self._pos2['multiplier']
+
+
+class CoveredPut(FutureOptionStrategy):
+    """备兑看跌组合 (看跌期权空头 + 期货空头)"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['option_mark_code'] and
+            pos1['long_short'] == 'short' and
+            pos2['long_short'] == 'short' and
+            pos2['call_put'] == 'put' and
+            exchange in {Exchange.DCE, Exchange.GFEX}
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self._pos1['margin'] + self._pos2['close_price'] * self._pos2['multiplier']
+
+
+class ProtectiveCall(FutureOptionStrategy):
+    """保护性看涨组合 (看涨期权多头 + 期货空头)"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['option_mark_code'] and
+            pos1['long_short'] == 'short' and
+            pos2['long_short'] == 'long' and
+            pos2['call_put'] == 'call' and
+            exchange == Exchange.DCE
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self._pos1['margin'] * 0.8
+
+
+class ProtectivePut(FutureOptionStrategy):
+    """保护性看跌组合 (看跌期权多头 + 期货多头)"""
+    @staticmethod
+    def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
+        exchange = pos1['exchange']
+        return (
+            pos1['code'] == pos2['option_mark_code'] and
+            pos1['long_short'] == 'long' and
+            pos2['long_short'] == 'long' and
+            pos2['call_put'] == 'put' and
+            exchange == Exchange.DCE
+        )
+
+    @cached_property
+    def margin(self) -> float:
+        return self._pos1['margin'] * 0.8
+
+
+class StrategyAnalyzer(ABC):
+    """组合策略分析器基类"""
     def __init__(self, pos1: pd.Series, pos2: pd.Series, is_close: bool):
         self.pos1 = pos1
         self.pos2 = pos2
         self.is_close = is_close
-        self.exchange = pos1['exchange']
-        self.strategy = StrategyType.Invalid
-        self.margin = pos1['margin'] + pos2['margin']
-        self.margin_saving = 0
 
-    def _update_margin(self, margin_strategy: float) -> None:
-        self.margin_saving = self.margin - margin_strategy
-        self.margin = margin_strategy
-
-    @classmethod
-    def create_analyzer(cls, pos1: pd.Series, pos2: pd.Series,
-                        is_close: bool) -> 'StrategyAnalyzer':
-        if pos1['type'] == PositionType.Future and pos2['type'] == PositionType.Future:
-            return FuturesStrategyAnalyzer(pos1, pos2, is_close)
-        elif pos1['type'] == PositionType.Option and pos2['type'] == PositionType.Option:
-            return OptionsStrategyAnalyzer(pos1, pos2, is_close)
-        else:
-            return FutureOptionStrategyAnalyzer(pos1, pos2, is_close)
+    @abstractmethod
+    def analyze(self) -> Strategy | None:
+        """分析两笔持仓头寸所能构成的组合策略"""
+        pass
 
 
 class FuturesStrategyAnalyzer(StrategyAnalyzer):
-    def analyze(self) -> dict:
-        criteria_public = (
-            self.pos1['long_short'] != self.pos2['long_short']
-        )
-        if criteria_public:
-            analysis_funcs = [
-                self._is_future_lock_position(),
-                self._is_calender_spread(),
-                self._is_inter_commodity_spread()
-            ]
-            for analysis_func in analysis_funcs:
-               if analysis_func:
-                    break
-        return {
-            'strategy': self.strategy,
-            'margin': self.margin,
-            'margin_saving': self.margin_saving
-        }
-
-    def _is_future_lock_position(self) -> bool:
-        """期货对锁"""
-        criteria = (
-            self.exchange in (Exchange.CZCE, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['code_original'] == self.pos2['code_original']
-        )
-        if criteria:
-            self.strategy = StrategyType.FutureLockPosition
-            margin_strategy = max(self.pos1['margin'], self.pos2['margin'])
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_calender_spread(self) -> bool:
-        """期货跨期"""
-        criteria = (
-            self.exchange in (Exchange.CZCE, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['variety'] == self.pos2['variety'] and
-            self.pos1['code_original'] != self.pos2['code_original']
-        )
-        if criteria:
-            self.strategy = StrategyType.CalendarSpread
-            margin_strategy = max(self.pos1['margin'], self.pos2['margin'])
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_inter_commodity_spread(self) -> bool:
-        """期货跨品种"""
-        criteria = (
-            self.exchange in (Exchange.CZCE, Exchange.DCE) and
-            self.pos1['variety'] != self.pos2['variety'] and
-            FutureVariety.is_commodity_pair(self.pos1['variety'], self.pos2['variety'])
-        )
-        if criteria:
-            self.strategy = StrategyType.InterCommoditySpread
-            margin_strategy = max(self.pos1['margin'], self.pos2['margin'])
-            self._upate_margin(margin_strategy)
-        return criteria
+    """期货组合策略分析器"""
+    def analyze(self) -> Strategy | None:
+        self.pos1, self.pos2 = FuturesStrategy.modify_positions(self.pos1, self.pos2)
+        for strategy in FuturesStrategy.__subclasses__():
+            if strategy.is_valid(self.pos1, self.pos2, self.is_close):
+                return strategy(self.pos1, self.pos2)
+        return None
 
 
 class OptionsStrategyAnalyzer(StrategyAnalyzer):
-    def analyze(self) -> dict:
-        criteria_public = (
-            self.pos1['option_mark_code'] == self.pos2['option_mark_code'] and
-            self.pos1['last_tradedate'] == self.pos2['last_tradedate'] and
-            'short' in (self.pos1['long_short'], self.pos2['long_short'])
-        )
-        if criteria_public:
-            if self.pos1['long_short'] == 'short' and self.pos2['long_short'] == 'long':
-                self.pos1, self.pos2 = self.pos2, self.pos1
-            elif (
-                self.pos1['long_short'] == self.pos2['long_short'] and
-                self.pos1['call_put'] == 'call' and
-                self.pos2['call_put'] == 'put'
-            ):
-                self.pos1, self.pos2 = self.pos2, self.pos1
-            analysis_funcs = [
-                self._is_bull_call_spread(),
-                self._is_bear_call_spread(),
-                self._is_bull_put_spread(),
-                self._is_bear_put_spread(),
-                self._is_strangle(),
-                self._is_option_lock_position()
-            ]
-            for analysis_func in analysis_funcs:
-                if analysis_func:
-                    break
-        return {
-            'strategy': self.strategy,
-            'margin': self.margin,
-            'margin_saving': self.margin_saving
-        }
-
-    def _is_bull_call_spread(self) -> bool:
-        """牛市看涨价差"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] != self.pos2['long_short'] and
-            self.pos1['call_put'] == 'call' and
-            self.pos2['call_put'] == 'call' and
-            self.pos1['strike_price'] - self.pos2['strike_price'] < -1e-6
-        )
-        if criteria:
-            self.strategy = StrategyType.BullCallSpread
-            if self.exchange in (Exchange.SH, Exchange.SZ):
-                margin_strategy = 0
-            else:
-                margin_strategy = self.pos2['margin'] * 0.2
-            self._update_margin(margin_strategy)
-
-    def _is_bear_call_spread(self) -> bool:
-        """熊市看涨价差"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] != self.pos2['long_short'] and
-            self.pos1['call_put'] == 'call' and
-            self.pos2['call_put'] == 'call' and
-            self.pos1['strike_price'] - self.pos2['strike_price'] > 1e-6
-        )
-        if criteria:
-            self.strategy = StrategyType.BearCallSpread
-            if self.exchange in (Exchange.SH, Exchange.SZ):
-                margin_strategy = ((self.pos1['strike_price'] - self.pos2['strike_price'])
-                                   * self.pos1['multiplier'])
-            else:
-                margin_strategy = min(
-                        (self.pos1['strike_price'] - self.pos2['strike_price']) * self.pos1['contract_unit'],
-                        self.pos2['margin']
-                    )
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_bull_put_spread(self) -> bool:
-        """牛市看跌价差"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] != self.pos2['long_short'] and
-            self.pos1['call_put'] == 'put' and
-            self.pos2['call_put'] == 'put' and
-            self.pos1['strike_price'] - self.pos2['strike_price'] < -1e-6
-        )
-        if criteria:
-            self.strategy = StrategyType.BullPutSpread
-            if self.exchange in (Exchange.SH, Exchange.SZ):
-                margin_strategy = ((self.pos2['strike_price'] - self.pos1['strike_price'])
-                                   * self.pos2['multiplier'])
-            else:
-                margin_strategy = min(
-                    (self.pos2['strike_price'] - self.pos1['strike_price']) * self.pos2['contract_unit'],
-                    self.pos2['margin']
-                )
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_bear_put_spread(self) -> bool:
-        """熊市看跌价差"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] != self.pos2['long_short'] and
-            self.pos1['call_put'] == 'put' and
-            self.pos2['call_put'] == 'put' and
-            self.pos1['strike_price'] - self.pos2['strike_price'] > 1e-6
-        )
-        if criteria:
-            self.strategy = StrategyType.BearPutSpread
-            if self.exchange in (Exchange.SH, Exchange.SZ):
-                margin_strategy = 0
-            else:
-                margin_strategy = self.pos2['margin'] * 0.2
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_strangle(self) -> bool:
-        """跨式、宽跨式"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.CZCE, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] == self.pos2['long_short'] and
-            self.pos1['call_put'] != self.pos2['call_put'] and
-            self.pos1['strike_price'] - self.pos2['strike_price'] < 1e-6
-        )
-        if criteria:
-            if self.pos1['strike_price'] - self.pos2['strike_price'] > -1e-6:    # 跨式
-                self.strategy = StrategyType.Straddle
-            else:    # 宽跨式
-                self.strategy = StrategyType.Strangle
-            margin_strategy = self._calc_margin_strangle()
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_option_lock_position(self) -> bool:
-        """期权对锁、自动对冲"""
-        criteria = (
-            self.exchange in (Exchange.SH, Exchange.SZ, Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] != self.pos2['long_short'] and
-            self.pos1['call_put'] == self.pos2['call_put'] and
-            abs(self.pos1['strike_price'] - self.pos2['strike_price']) < 1e-6
-        )
-        if criteria:
-            if self.exchange in (Exchange.SH, Exchange.SZ):
-                if self.is_close:    # 期权自动对冲
-                    self.strategy = StrategyType.AutoHedging
-                    margin_strategy = 0
-                    self._update_margin(margin_strategy)
-
-                    # 上交所、深交所盘后自动对冲, 不属于持仓策略, 在优化过程中添加惩罚项以降低优先级
-                    penalty = 10
-                    self.margin_saving -= penalty
-
-            else:    # 期权对锁
-                self.strategy = StrategyType.OptionLockPosition
-                margin_strategy = self.pos2['margin'] * 0.2
-                self._update_margin(margin_strategy)
-        return criteria
-
-    def _calc_margin_strangle(self) -> float:
-        """计算跨式、宽跨式组合保证金"""
-        if self.pos1['margin'] - self.pos2['margin'] < -1e-6:
-            pos_higher, pos_lower = self.pos2, self.pos1
-        elif self.pos1['margin'] - self.pos2['margin'] > 1e-6:
-            pos_higher, pos_lower = self.pos1, self.pos2
-        else:
-            if self.pos1['pv'] - self.pos2['pv'] < 1e-6:
-                pos_higher, pos_lower = self.pos2, self.pos1
-            else:
-                pos_higher, pos_lower = self.pos1, self.pos2
-        if self.exchange in (Exchange.SH, Exchange.SZ):
-            return pos_higher['margin'] + pos_lower['pv'] * pos_lower['multiplier']
-        else:
-            return pos_higher['margin'] + pos_lower['pv'] * pos_lower['contract_unit']
+    """期权组合策略分析器"""
+    def analyze(self) -> Strategy | None:
+        self.pos1, self.pos2 = OptionsStrategy.modify_positions(self.pos1, self.pos2)
+        for strategy in OptionsStrategy.__subclasses__():
+            if strategy.is_valid(self.pos1, self.pos2, self.is_close):
+                return strategy(self.pos1, self.pos2)
+        return None
 
 
 class FutureOptionStrategyAnalyzer(StrategyAnalyzer):
-    def analyze(self) -> dict:
-        if self.pos1['type'] == PositionType.Option and self.pos2['type'] == PositionType.Future:
-            self.pos1, self.pos2 = self.pos2, self.pos1
-        criteria_public = (
-            self.pos2['option_mark_code'] == self.pos1['code_original']
-        )
-        if criteria_public:
-            analysis_funcs = [
-                self._is_covered_call(),
-                self._is_covered_put(),
-                self._is_protective_call(),
-                self._is_protective_put(),
-            ]
-            for analysis_func in analysis_funcs:
-                if analysis_func:
-                    break
-        return {
-            'strategy': self.strategy,
-            'margin': self.margin,
-            'margin_saving': self.margin_saving
+    """期货期权组合策略分析器"""
+    def analyze(self) -> Strategy | None:
+        self.pos1, self.pos2 = FutureOptionStrategy.modify_positions(self.pos1, self.pos2)
+        for strategy in FutureOptionStrategy.__subclasses__():
+            if strategy.is_valid(self.pos1, self.pos2, self.is_close):
+                return strategy(self.pos1, self.pos2)
+        return None
+
+
+class StrategyAnalyzerFactory:
+    """组合策略分析器工厂类"""
+    @staticmethod
+    def create(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> StrategyAnalyzer:
+        """根据两笔持仓头寸类型, 创建对应的组合策略分析器"""
+        analyzer_map = {
+            (PositionType.Future, PositionType.Future): FuturesStrategyAnalyzer,
+            (PositionType.Option, PositionType.Option): OptionsStrategyAnalyzer,
+            (PositionType.Future, PositionType.Option): FutureOptionStrategyAnalyzer,
+            (PositionType.Option, PositionType.Future): FutureOptionStrategyAnalyzer,
         }
-
-    def _is_covered_call(self) -> bool:
-        """看涨期权空头 + 期货多头"""
-        criteria = (
-            self.exchange in (Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] == 'long' and
-            self.pos2['long_short'] == 'short' and
-            self.pos2['call_put'] == 'call'
-        )
-        if criteria:
-            self.strategy = StrategyType.CoveredCall
-            margin_strategy = self.pos1['margin'] + self.pos2['pv'] * self.pos2['contract_unit']
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_covered_put(self) -> bool:
-        """看跌期权空头 + 期货空头"""
-        criteria = (
-            self.exchange in (Exchange.DCE, Exchange.GFEX) and
-            self.pos1['long_short'] == 'short' and
-            self.pos2['long_short'] == 'short' and
-            self.pos2['call_put'] == 'put'
-        )
-        if criteria:
-            self.strategy = StrategyType.CoveredPut
-            margin_strategy = self.pos1['margin'] + self.pos2['pv'] * self.pos2['contract_unit']
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_protective_call(self) -> bool:
-        """看涨期权多头 + 期货空头"""
-        criteria = (
-            self.exchange == Exchange.DCE and
-            self.pos1['long_short'] == 'short' and
-            self.pos2['long_short'] == 'long' and
-            self.pos2['call_put'] == 'call'
-        )
-        if criteria:
-            self.strategy = StrategyType.ProtectiveCall
-            margin_strategy = self.pos1['margin'] * 0.8
-            self._update_margin(margin_strategy)
-        return criteria
-
-    def _is_protective_put(self) -> bool:
-        """看跌期权多头 + 期货多头"""
-        criteria = (
-            self.exchange == Exchange.DCE and
-            self.pos1['long_short'] == 'long' and
-            self.pos2['long_short'] == 'long' and
-            self.pos2['call_put'] == 'put'
-        )
-        if criteria:
-            self.strategy = StrategyType.ProtectivePut
-            margin_strategy = self.pos1['margin'] * 0.8
-            self._update_margin(margin_strategy)
-        return criteria
+        if (pos1['type'], pos2['type']) in analyzer_map:
+            analyzer = analyzer_map.get((pos1['type'], pos2['type']))
+            return analyzer(pos1, pos2, is_close)
+        else:
+            raise ValueError('Invalid position types.')
