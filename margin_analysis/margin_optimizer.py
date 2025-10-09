@@ -48,8 +48,8 @@ class MarginOptimizer:
                 continue
             temp['code_dir'] = temp['code_dir'].apply(lambda x: (anchor_pos['code_dir'], x))
             temp = temp[['code_dir', 'type', 'margin', 'margin_saving']]
-            dfs = [df for df in [avail_strats, temp] if not df.empty]
-            avail_strats = pd.concat(dfs, ignore_index=True)
+            dfs_to_concate = [df for df in [avail_strats, temp] if not df.empty]
+            avail_strats = pd.concat(dfs_to_concate, ignore_index=True)
         return avail_strats
 
     def _optimize(self) -> pd.DataFrame:
@@ -85,8 +85,8 @@ class MarginOptimizer:
             remaining_pos = self.holding_separated[['code_dir', 'type', 'margin']].copy()
             remaining_pos['quantity'] = ub - A @ res.x
             remaining_pos = remaining_pos[remaining_pos['quantity'] > 0].reset_index(drop=True)
-            dfs = [df for df in [remaining_pos, selected_strats] if not df.empty]
-            return pd.concat(dfs, ignore_index=True)
+            dfs_to_concate = [df for df in [remaining_pos, selected_strats] if not df.empty]
+            return pd.concat(dfs_to_concate, ignore_index=True)
         else:
             raise ValueError('Optimization failed.')
 
@@ -129,7 +129,7 @@ class MarginOptimizer:
     
     def run(self) -> pd.DataFrame:
         """对所有账号持仓进行保证金优化"""
-        dfs = []
+        dfs_to_concate = []
         groups = self.holding.groupby(['exchange', 'account'])
         for (exchange, account), holding_account in groups:
             self.holding_separated = holding_account.copy()
@@ -139,5 +139,5 @@ class MarginOptimizer:
             optimization_result['account'] = account
             optimization_result = optimization_result[[
                 'exchange', 'account', 'code_dir', 'type', 'quantity', 'margin']]
-            dfs.append(optimization_result)
-        return pd.concat(dfs, ignore_index=True)
+            dfs_to_concate.append(optimization_result)
+        return pd.concat(dfs_to_concate, ignore_index=True)
