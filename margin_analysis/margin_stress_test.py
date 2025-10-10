@@ -1,3 +1,4 @@
+from typing import Optional
 import numpy as np
 import pandas as pd
 from base import PositionType
@@ -7,175 +8,161 @@ from margin_calculator import MarginCalculator
 class MarginStressTest:
     def __init__(self, holding: pd.DataFrame,
                  margin_account: pd.DataFrame,
-                 margin_ratio: pd.DataFrame,
-                 cov: pd.DataFrame,
-                 supplement: pd.DataFrame,
                  target_risk_ratio: float = 0.95):
         self.holding = holding
         self.margin_account = margin_account
-        self.margin_ratio = margin_ratio
-        self.supplement = supplement
         self.target_risk_ratio = target_risk_ratio
 
-        self.holding['variety_temp'] = self.holding.apply(
-            lambda x: x['option_mark_code'] if x['type'] == PositionType.Option else x['variety'],
-            axis=1)
-        varieties = self.holding['variety_temp'].unique()
-        self.varieties = varieties
-        self.variety_idx_map = {variety: idx for idx, variety in enumerate(varieties)}
-        self.cov = cov.loc[varieties, varieties].values.astype(float)
+    @staticmethod
+    def calc_pnl_margin_r(pos: pd.Series, r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """计算单笔持仓在一系列标的收益率下的盈亏和保证金"""
+        quantity = pos['quantity']
+        quantity_dir = quantity * {'long': 1, 'short': -1}.get(pos['long_short'])
+        margin_calculator = MarginCalculator(pos)
+        if pos['type'] == PositionType.Future:
+            price = pos['close_price'] * (1 + r)
+            pnl = (price - pos['close_price']) * quantity_dir
+            calc_margin_vec = np.vectorize(margin_calculator.calc_future)
+            margin = calc_margin_vec(close_price=price) * quantity
+        elif pos['type'] == PositionType.Option:
+            s = pos['udl_price'] * (1 + r)
+            price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
+                        + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])
+            pnl = (price - pos['close_price']) * quantity_dir
+            calc_margin_vec = np.vectorize(margin_calculator.calc_option)
+            margin = calc_margin_vec(udl_price=s, close_price=price) * quantity
+        return pnl, margin
 
 
 class MarginStressVaR(MarginStressTest):
     def __init__(self, holding: pd.DataFrame,
                  margin_account: pd.DataFrame,
-                 margin_ratio: pd.DataFrame,
-                 cov: pd.DataFrame,
                  supplement: pd.DataFrame,
-                 target_risk_ratio: float = 0.95):
-        super().__init__(holding, margin_account, margin_ratio, cov, supplement, target_risk_ratio)
-        self.p = 90    # VaR 分位数
-        self.dt = 1 / 252
-        self.n_step = 2
+                 cov: pd.DataFrame,
+                 mu: pd.DataFrame,
+                 target_risk_ratio: float = 0.95,
+                 VaR_percentile: int = 90,
+                 dt: float = 1 / 252,
+                 n_step: int = 2):
+        super().__init__(holding, margin_account, target_risk_ratio)
+        self.supplement = supplement
+        udls = self.holding['udl'].unique()
+        self.udl_idx_map = {udl: idx for idx, udl in enumerate(udls)}
+        cov.where(~cov.isna(), cov.T, inplace=True)
+        self.cov = cov.loc[udls, udls].values.astype(float)
+        self.mu = mu['mu'].reindex(udls, fill_value=0).values.astype(float)
+        self.VaR_percentile = VaR_percentile
+        self.dt = dt
+        self.n_step = n_step
 
-    def _get_cov_cholesky(self):
-        n_variety = len(self.varieties)
+    def _get_cov_cholesky(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cholesky分解协方差矩阵, 返回L矩阵和波动率向量"""
+        n_udl = len(self.cov)
         vol_vec = np.diag(self.cov)
-        corr_matrix = (np.triu(self.cov) + np.triu(self.cov).T
-                       - 2*np.diag(np.diag(self.cov)) + np.eye(n_variety))
-        cov_matrix = corr_matrix * np.outer(vol_vec, vol_vec)
+        corr = (np.triu(self.cov) + np.triu(self.cov).T
+                       - 2*np.diag(np.diag(self.cov)) + np.eye(n_udl))
+        cov_matrix = corr * np.outer(vol_vec, vol_vec)
         L = np.linalg.cholesky(cov_matrix)
         return L, vol_vec
 
-    def gen_path(self, n_path: int, seed: int | None = None):
+    def _gen_path(self, n_path: int = 10000, seed: Optional[int] = None) -> np.ndarray:
+        """生成标的收益率路径, shape: (n_step, n_udl, n_path)"""
         L, vol_vec = self._get_cov_cholesky()
-        n_variety = len(vol_vec)
-        r_path = np.empty((self.n_step, n_variety, n_path))
+        n_udl = len(vol_vec)
+        r_path = np.empty((self.n_step, n_udl, n_path))
         if seed:
             np.random.seed(seed)
-        Z = np.random.standard_normal((self.n_step, n_variety, n_path))
-        # TODO: for etf and index, r-q!=0
-        log_r_path = -0.5 * vol_vec[None, :, None]**2 * self.dt + L @ Z * np.sqrt(self.dt)
+        Z = np.random.standard_normal((self.n_step, n_udl, n_path))
+        log_r_path = ((self.mu[None, :, None] - 0.5 * vol_vec[None, :, None]**2) * self.dt
+                      + L @ Z * np.sqrt(self.dt))
         log_r_path = log_r_path.cumsum(axis=0)
-        r_path = np.exp(log_r_path)
+        r_path = np.exp(log_r_path) - 1
         return r_path
 
-    def calc_path(self, r_path):
-        n_step, n_variety, n_path = r_path.shape
-        pnl = np.zeros((n_step, n_path))
-        margin = np.zeros((n_step, n_path))
-        for _, pos in self.holding_separated.iterrows():
-            pos = pos.copy()
-            quantity = pos['quantity']
-            quantity_dir = quantity * {'long': 1, 'short': -1}.get(pos['long_short'])
-            variety = pos['variety_temp']
-            idx = self.variety_idx_map[variety]
-            r = r_path[:, idx, :]
-            margin_calculator = MarginCalculator(pos, self.margin_ratio)
-            if pos['type'] == PositionType.Future:
-                price = r * pos['close_price']
-                pnl += (price - pos['close_price']) * quantity_dir
-                calc_margin_vec = np.vectorize(margin_calculator.calc_future)
-                margin_pos = calc_margin_vec(price)
-                margin += margin_pos * pos['quantity']
-            elif pos['type'] == PositionType.Option:
-                s = r * pos['udl_price']
-                '''
-                Delta、Gamma近似估计期权价格的变化
-                    params: delta, gamma
-                也可以通过实现定价公式来计算 (欧式、美式)
-                    params: r, q, sigma, T
-                '''
-                pos['delta'] = 0.5
-                pos['gamma'] = 0.02
-                price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
-                         + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])
-                pnl += (price - pos['close_price']) * quantity_dir
-                calc_margin_vec = np.vectorize(margin_calculator.calc_option)
-                margin_pos = calc_margin_vec(s, price)
-                margin += margin_pos * quantity
+    def _calc_path(self, r_path: np.ndarray, holding_account: pd.DataFrame
+                  ) -> tuple[np.ndarray, np.ndarray]:
+        """计算单个持仓账户在各标的收益率路径下的持仓盈亏与保证金, shape: (n_step, n_path)"""
+        pnls_pos, margins_pos = zip(*holding_account.apply(
+            lambda pos: self.calc_pnl_margin_r(
+                pos, r_path[:, self.udl_idx_map[pos['udl']], :]), axis=1))
+        pnl = np.sum(pnls_pos, axis=0)
+        margin = np.sum(margins_pos, axis=0)
         return pnl, margin
 
-    def run(self):
-        columns = ['account'] + [f'T+{i}' for i in range(self.n_step)] + ['increasement']
-        out_df = pd.DataFrame(columns=columns)
-        r_path = self.gen_path(n_path=100000)
+    def _calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
+                            supplement: pd.Series, equity: float | int) -> np.ndarray:
+        """计算单个持仓账户通过模拟得到的风险度VaR, shape: (n_step,)"""
+        pnl, margin = self._calc_path(r_path, holding_account)
+        equity = np.full_like(pnl, fill_value=equity)
+        equity += pnl + supplement.values.cumsum()[:, None]
+        risk_ratio = margin / equity
+        risk_ratio_VaR = np.percentile(risk_ratio, self.VaR_percentile, axis=1)
+        return risk_ratio_VaR
+
+    def run(self, n_path: int = 10000, seed: Optional[int] = None) -> pd.DataFrame:
+        """通过模拟, 计算各持仓账户的风险度VaR"""
+        columns = ['Account'] + [f'T+{i}' for i in range(self.n_step)] + ['Increasement']
+        VaR_df = pd.DataFrame(columns=columns)
+        r_path = self._gen_path(n_path, seed)
         for account, account_info in self.margin_account.iterrows():
             equity = account_info['equity']
-            holding_account = self.holding[self.holding['account'] == account]
+            holding_account = self.holding[self.holding['account'] == account].copy()
             holding_account.reset_index(drop=True, inplace=True)
             if holding_account.empty:
                 continue
-            total_margin = holding_account.apply(
-                lambda x: x['quantity'] * x['margin'], axis=1).sum()
-            remaining = max(total_margin - equity, 0)
-            self.holding_separated = holding_account.copy()
+            remaining = max(sum(holding_account['total_margin']) - equity, 0)
             supplement = self.supplement.loc[account]
-            
-            pnl, margin = self.calc_path(r_path)
-            equity += pnl + supplement.values.cumsum()[:, None]
-            risk_ratio = margin / equity
-            risk_ratio_VaR = np.percentile(risk_ratio, self.p, axis=1)
-            out_df.loc[len(out_df)] = [account, *risk_ratio_VaR, remaining]
-        out_df.dropna(inplace=True)
-        out_df.set_index('account', inplace=True)
-        return out_df
+            risk_ratio_VaR = self._calc_risk_ratio_VaR(r_path, holding_account, supplement, equity)
+            VaR_df.loc[len(VaR_df)] = [account, *risk_ratio_VaR, remaining]
+        VaR_df.dropna(inplace=True)
+        VaR_df.set_index('Account', inplace=True)
+        return VaR_df
 
 
 class MarginScenarioAnalysis(MarginStressTest):
     def __init__(self, holding: pd.DataFrame,
                  margin_account: pd.DataFrame,
-                 margin_ratio: pd.DataFrame,
-                 cov: pd.DataFrame,
-                 supplement: pd.DataFrame,
-                 udl_return_scenarios: np.ndarray,
+                 scenarios_r: np.ndarray,
                  target_risk_ratio: float = 0.95):
-        super().__init__(holding, margin_account, margin_ratio, cov, supplement, target_risk_ratio)
-        self.udl_return_scenarios = udl_return_scenarios
+        super().__init__(holding, margin_account, target_risk_ratio)
+        self.scenarios_r = scenarios_r
 
-    def calc_udl_return_scenario(self, udl_return):
-        pnl = 0
-        margin = 0
-        for _, pos in self.holding_separated.iterrows():
-            pos = pos.copy()
-            quantity = pos['quantity']
-            quantity_dir = quantity * {'long': 1, 'short': -1}.get(pos['long_short'])
-            if pos['type'] == PositionType.Future:
-                price = pos['close_price'] * (1 + udl_return)
-                pnl += (price - pos['close_price']) * quantity_dir
-                margin_calculator = MarginCalculator(pos, self.margin_ratio)
-                margin_pos = margin_calculator.calc_future(price)
-                margin += margin_pos * pos['quantity']
-            elif pos['type'] == PositionType.Option:
-                s = pos['udl_price'] * (1 + udl_return)
-                pos['delta'] = 0.5
-                pos['gamma'] = 0.02
-                price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
-                         + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])
-                pnl += (price - pos['close_price']) * quantity_dir
-                margin_calculator = MarginCalculator(pos, self.margin_ratio)
-                margin_pos = margin_calculator.calc_option(s, price)
-                margin += margin_pos * quantity
+    def _calc_udl_return_scenarios(self, holding_account: pd.DataFrame
+                                  ) -> tuple[np.ndarray, np.ndarray]:
+        """计算单个持仓账户在一系列标的收益率情景下的持仓盈亏与保证金"""
+        pnls_pos, margins_pos = zip(*holding_account.apply(
+            lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1))
+        pnl = np.sum(pnls_pos, axis=0)
+        margin = np.sum(margins_pos, axis=0)
         return pnl, margin
 
-    def run(self):
-        columns = ['account', 'udl_return', 'risk_ratio', 'supplement']
-        out_df = pd.DataFrame(columns=columns)
+    def _calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
+                                   equity: float | int) -> tuple[np.ndarray, np.ndarray]:
+        """计算单个持仓账户在一系列标的收益率情景下的风险度与入金"""
+        pnl, margin = self._calc_udl_return_scenarios(holding_account)
+        equity = np.full_like(pnl, fill_value=equity)
+        equity += pnl
+        risk_ratio = margin / equity
+        supplement = np.maximum(margin/self.target_risk_ratio - equity, 0)
+        return risk_ratio, supplement
+
+    def run(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """在一系列标的收益率情景下, 分析各持仓账户的风险度与入金"""
+        temp_dfs = []
         for account, account_info in self.margin_account.iterrows():
             equity = account_info['equity']
             holding_account = self.holding[self.holding['account'] == account]
             holding_account.reset_index(drop=True, inplace=True)
             if holding_account.empty:
                 continue
-            self.holding_separated = holding_account.copy()
-
-            for udl_return in self.udl_return_scenarios:
-                pnl, margin = self.calc_udl_return_scenario(udl_return)
-                equity += pnl
-                risk_ratio = margin / equity
-                supplement = max(margin / self.target_risk_ratio - equity, 0)
-                out_df.loc[len(out_df)] = [account, udl_return, risk_ratio, supplement]
-        out_df.dropna(inplace=True)
-        pivot_risk_ratio = out_df.pivot_table(index='account', columns='udl_return', values='risk_ratio')
-        pivot_supplement = out_df.pivot_table(index='account', columns='udl_return', values='supplement')
+            risk_ratio, supplement = self._calc_risk_ratio_supplement(holding_account, equity)
+            temp_dfs.append(pd.DataFrame({
+                'Account': account,
+                'r': self.scenarios_r,
+                'RiskRatio': risk_ratio,
+                'Supplement': supplement
+            }))
+        scenario_df = pd.concat(temp_dfs, ignore_index=True)
+        pivot_risk_ratio = scenario_df.pivot(index='Account', columns='r', values='RiskRatio')
+        pivot_supplement = scenario_df.pivot(index='Account', columns='r', values='Supplement')
         return pivot_risk_ratio, pivot_supplement
