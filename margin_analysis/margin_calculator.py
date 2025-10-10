@@ -1,13 +1,11 @@
-from typing import Optional
 import pandas as pd
 from base import PositionType, Exchange
 
 
 class MarginCalculator:
-    def __init__(self, pos: pd.Series, margin_ratio: Optional[float]):
+    def __init__(self, pos: pd.Series):
         for key, value in pos.dropna().items():
             setattr(self, key, value)
-        self.margin_ratio = margin_ratio
 
     def calc(self, **kwargs) -> float:
         if self.type == PositionType.Future:
@@ -16,12 +14,28 @@ class MarginCalculator:
             return self.calc_option(**kwargs)
 
     def calc_future(self, **kwargs) -> float:
+        """
+        计算期货持仓保证金
+
+        Args:
+            **kwargs: 可选参数, 用于更新持仓属性, 如 close_price
+        Returns:
+            float: 保证金金额
+        """
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
         return self.close_price * self.multiplier * self.margin_ratio
 
     def calc_option(self, **kwargs) -> float:
+        """
+        计算期权持仓保证金
+
+        Args:
+            **kwargs: 可选参数, 用于更新持仓属性, 如 udl_price, close_price
+        Returns:
+            float: 保证金金额
+        """
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
