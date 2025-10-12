@@ -27,7 +27,7 @@ class MarginStressTest:
         elif pos['type'] == PositionType.Option:
             s = pos['udl_price'] * (1 + r)
             price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
-                        + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])
+                        + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])    # delta-gamma近似
             pnl = (price - pos['close_price']) * quantity_dir
             calc_margin_vec = np.vectorize(margin_calculator.calc_option)
             margin = calc_margin_vec(udl_price=s, close_price=price) * quantity
@@ -48,7 +48,10 @@ class MarginStressVaR(MarginStressTest):
         self.supplement = supplement
         udls = self.holding['udl'].unique()
         self.udl_idx_map = {udl: idx for idx, udl in enumerate(udls)}
-        cov.where(~cov.isna(), cov.T, inplace=True)
+        # cov: 上三角阵
+        #    - 对角线: 波动率
+        #    - 非对角线: 相关系数
+        cov.fillna(cov.T, inplace=True)
         self.cov = cov.loc[udls, udls].values.astype(float)
         self.mu = mu['mu'].reindex(udls, fill_value=0).values.astype(float)
         self.VaR_percentile = VaR_percentile
@@ -59,8 +62,7 @@ class MarginStressVaR(MarginStressTest):
         """Cholesky分解协方差矩阵, 返回L矩阵和波动率向量"""
         n_udl = len(self.cov)
         vol_vec = np.diag(self.cov)
-        corr = (np.triu(self.cov) + np.triu(self.cov).T
-                       - 2*np.diag(np.diag(self.cov)) + np.eye(n_udl))
+        corr = self.cov - np.diag(np.diag(self.cov)) + np.eye(n_udl)
         cov_matrix = corr * np.outer(vol_vec, vol_vec)
         L = np.linalg.cholesky(cov_matrix)
         return L, vol_vec
@@ -70,7 +72,7 @@ class MarginStressVaR(MarginStressTest):
         L, vol_vec = self._get_cov_cholesky()
         n_udl = len(vol_vec)
         r_path = np.empty((self.n_step, n_udl, n_path))
-        if seed:
+        if seed is not None:
             np.random.seed(seed)
         Z = np.random.standard_normal((self.n_step, n_udl, n_path))
         log_r_path = ((self.mu[None, :, None] - 0.5 * vol_vec[None, :, None]**2) * self.dt
@@ -80,7 +82,7 @@ class MarginStressVaR(MarginStressTest):
         return r_path
 
     def _calc_path(self, r_path: np.ndarray, holding_account: pd.DataFrame
-                  ) -> tuple[np.ndarray, np.ndarray]:
+                   ) -> tuple[np.ndarray, np.ndarray]:
         """计算单个持仓账户在各标的收益率路径下的持仓盈亏与保证金, shape: (n_step, n_path)"""
         pnls_pos, margins_pos = zip(*holding_account.apply(
             lambda pos: self.calc_pnl_margin_r(
@@ -90,7 +92,7 @@ class MarginStressVaR(MarginStressTest):
         return pnl, margin
 
     def _calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
-                            supplement: pd.Series, equity: float | int) -> np.ndarray:
+                             supplement: pd.Series, equity: float | int) -> np.ndarray:
         """计算单个持仓账户通过模拟得到的风险度VaR, shape: (n_step,)"""
         pnl, margin = self._calc_path(r_path, holding_account)
         equity = np.full_like(pnl, fill_value=equity)
@@ -128,7 +130,7 @@ class MarginScenarioAnalysis(MarginStressTest):
         self.scenarios_r = scenarios_r
 
     def _calc_udl_return_scenarios(self, holding_account: pd.DataFrame
-                                  ) -> tuple[np.ndarray, np.ndarray]:
+                                   ) -> tuple[np.ndarray, np.ndarray]:
         """计算单个持仓账户在一系列标的收益率情景下的持仓盈亏与保证金"""
         pnls_pos, margins_pos = zip(*holding_account.apply(
             lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1))
@@ -137,7 +139,7 @@ class MarginScenarioAnalysis(MarginStressTest):
         return pnl, margin
 
     def _calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
-                                   equity: float | int) -> tuple[np.ndarray, np.ndarray]:
+                                    equity: float | int) -> tuple[np.ndarray, np.ndarray]:
         """计算单个持仓账户在一系列标的收益率情景下的风险度与入金"""
         pnl, margin = self._calc_udl_return_scenarios(holding_account)
         equity = np.full_like(pnl, fill_value=equity)
