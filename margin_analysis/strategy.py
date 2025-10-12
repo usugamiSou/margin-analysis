@@ -139,7 +139,7 @@ class BullCallSpread(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
             pos1['call_put'] == 'call' and
@@ -162,7 +162,7 @@ class BearCallSpread(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
             pos1['call_put'] == 'call' and
@@ -182,7 +182,7 @@ class BullPutSpread(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
             pos1['call_put'] == 'put' and
@@ -202,7 +202,7 @@ class BearPutSpread(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] != pos2['long_short'] and    # pos1 多, pos2 空
             pos1['call_put'] == 'put' and
@@ -225,7 +225,7 @@ class Straddle(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] == 'short' and
             pos2['long_short'] == 'short' and
@@ -258,7 +258,7 @@ class Strangle(OptionsStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['option_mark_code'] == pos2['option_mark_code'] and
+            pos1['udl'] == pos2['udl'] and
             pos1['last_tradedate'] == pos2['last_tradedate'] and
             pos1['long_short'] == 'short' and
             pos2['long_short'] == 'short' and
@@ -311,7 +311,7 @@ class CoveredCall(FutureOptionStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['code'] == pos2['option_mark_code'] and
+            pos1['code'] == pos2['udl'] and
             pos1['long_short'] == 'long' and
             pos2['long_short'] == 'short' and
             pos2['call_put'] == 'call' and
@@ -329,7 +329,7 @@ class CoveredPut(FutureOptionStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['code'] == pos2['option_mark_code'] and
+            pos1['code'] == pos2['udl'] and
             pos1['long_short'] == 'short' and
             pos2['long_short'] == 'short' and
             pos2['call_put'] == 'put' and
@@ -347,7 +347,7 @@ class ProtectiveCall(FutureOptionStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['code'] == pos2['option_mark_code'] and
+            pos1['code'] == pos2['udl'] and
             pos1['long_short'] == 'short' and
             pos2['long_short'] == 'long' and
             pos2['call_put'] == 'call' and
@@ -365,7 +365,7 @@ class ProtectivePut(FutureOptionStrategy):
     def is_valid(pos1: pd.Series, pos2: pd.Series, is_close: bool) -> bool:
         exchange = pos1['exchange']
         return (
-            pos1['code'] == pos2['option_mark_code'] and
+            pos1['code'] == pos2['udl'] and
             pos1['long_short'] == 'long' and
             pos2['long_short'] == 'long' and
             pos2['call_put'] == 'put' and
