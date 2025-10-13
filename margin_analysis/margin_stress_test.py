@@ -51,7 +51,7 @@ class MarginStressVaR(MarginStressTest):
         # cov: 上三角阵
         #    - 对角线: 波动率
         #    - 非对角线: 相关系数
-        cov.fillna(cov.T, inplace=True)
+        cov = cov.fillna(cov.T)
         self.cov = cov.loc[udls, udls].values.astype(float)
         self.mu = mu['mu'].reindex(udls, fill_value=0).values.astype(float)
         self.VaR_percentile = VaR_percentile
@@ -67,7 +67,7 @@ class MarginStressVaR(MarginStressTest):
         L = np.linalg.cholesky(cov_matrix)
         return L, vol_vec
 
-    def _gen_path(self, n_path: int = 10000, seed: Optional[int] = None) -> np.ndarray:
+    def gen_path(self, n_path: int = 10000, seed: Optional[int] = None) -> np.ndarray:
         """生成标的收益率路径, shape: (n_step, n_udl, n_path)"""
         L, vol_vec = self._get_cov_cholesky()
         n_udl = len(vol_vec)
@@ -91,7 +91,7 @@ class MarginStressVaR(MarginStressTest):
         margin = np.sum(margins_pos, axis=0)
         return pnl, margin
 
-    def _calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
+    def calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
                              supplement: pd.Series, equity: float | int) -> np.ndarray:
         """计算单个持仓账户通过模拟得到的风险度VaR, shape: (n_step,)"""
         pnl, margin = self._calc_path(r_path, holding_account)
@@ -138,7 +138,7 @@ class MarginScenarioAnalysis(MarginStressTest):
         margin = np.sum(margins_pos, axis=0)
         return pnl, margin
 
-    def _calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
+    def calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
                                     equity: float | int) -> tuple[np.ndarray, np.ndarray]:
         """计算单个持仓账户在一系列标的收益率情景下的风险度与入金"""
         pnl, margin = self._calc_udl_return_scenarios(holding_account)
@@ -168,3 +168,58 @@ class MarginScenarioAnalysis(MarginStressTest):
         pivot_risk_ratio = scenario_df.pivot(index='Account', columns='r', values='RiskRatio')
         pivot_supplement = scenario_df.pivot(index='Account', columns='r', values='Supplement')
         return pivot_risk_ratio, pivot_supplement
+
+
+class MarginStressTestCombined(MarginStressTest):
+    def __init__(self, holding: pd.DataFrame,
+                 margin_account: pd.DataFrame,
+                 supplement: pd.DataFrame,
+                 cov: pd.DataFrame,
+                 mu: pd.DataFrame,
+                 scenarios_r: np.ndarray,
+                 target_risk_ratio: float = 0.95,
+                 VaR_percentile: int = 90,
+                 dt: float = 1 / 252,
+                 n_step: int = 2):
+        super().__init__(holding, margin_account, target_risk_ratio)
+        self.msv = MarginStressVaR(
+            holding, margin_account, supplement, cov, mu,
+            target_risk_ratio, VaR_percentile, dt, n_step
+        )
+        self.msa = MarginScenarioAnalysis(
+            holding, margin_account, scenarios_r, target_risk_ratio
+        )
+
+    def run(self, n_path: int = 10000, seed: Optional[int] = None
+            ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """计算各持仓账户的风险度VaR, 以及在一系列情景下的风险度与入金"""
+        columns = ['Account'] + [f'T+{i}' for i in range(self.msv.n_step)] + ['Increasement']
+        VaR_df = pd.DataFrame(columns=columns)
+        temp_dfs = []
+        r_path = self.msv.gen_path(n_path, seed)
+
+        for account, account_info in self.margin_account.iterrows():
+            equity = account_info['equity']
+            holding_account = self.holding[self.holding['account'] == account].copy()
+            holding_account.reset_index(drop=True, inplace=True)
+            if holding_account.empty:
+                continue
+            # VaR
+            remaining = max(sum(holding_account['total_margin']) - equity, 0)
+            supplement = self.msv.supplement.loc[account]
+            risk_ratio_VaR = self.msv.calc_risk_ratio_VaR(r_path, holding_account, supplement, equity)
+            VaR_df.loc[len(VaR_df)] = [account, *risk_ratio_VaR, remaining]
+            # Scenario
+            risk_ratio, supplement = self.msa.calc_risk_ratio_supplement(holding_account, equity)
+            temp_dfs.append(pd.DataFrame({
+                'Account': account,
+                'r': self.msa.scenarios_r,
+                'RiskRatio': risk_ratio,
+                'Supplement': supplement
+            }))
+        VaR_df.dropna(inplace=True)
+        VaR_df.set_index('Account', inplace=True)
+        scenario_df = pd.concat(temp_dfs, ignore_index=True)
+        pivot_risk_ratio = scenario_df.pivot(index='Account', columns='r', values='RiskRatio')
+        pivot_supplement = scenario_df.pivot(index='Account', columns='r', values='Supplement')
+        return VaR_df, pivot_risk_ratio, pivot_supplement
