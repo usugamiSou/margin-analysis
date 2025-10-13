@@ -98,7 +98,7 @@ class HoldingDataProcessor:
                                                inplace=True)
             self.commodity_futures_data = self.commodity_futures_data[columns]
         dfs_to_concat = [df for df in [self.stock_futures_data, self.commodity_futures_data]
-               if not df.empty]
+                         if not df.empty]
         futures_data = pd.concat(dfs_to_concat, ignore_index=True)
         futures_data.rename(columns={'future_code': 'code'}, inplace=True)
         holding_futures = pd.merge(holding_futures, futures_data, on='code', how='left')
@@ -121,7 +121,7 @@ class HoldingDataProcessor:
                                                inplace=True)
             self.commodity_options_data = self.commodity_options_data[columns]
         dfs_to_concat = [df for df in [self.stock_options_data, self.commodity_options_data]
-               if not df.empty]
+                         if not df.empty]
         options_data = pd.concat(dfs_to_concat, ignore_index=True)
         options_data.rename(columns={'option_code': 'code', 'option_mark_code': 'udl'},
                             inplace=True)
