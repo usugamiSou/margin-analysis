@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from data_utils import DataLoader, HoldingDataProcessor
 from margin_optimizer import MarginOptimizer
-from margin_stress_test import MarginStressVaR, MarginScenarioAnalysis
+from margin_stress_test import MarginStressTestCombined
 
 
 root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,13 +39,12 @@ def main():
     optimum.to_csv(optimization_csv, index=False)
     print(f'The optimal holding has been saved to {optimization_csv}.')
 
-    msv = MarginStressVaR(processed_holding, margin_account, supplement, cov, mu)
-    VaR = msv.run()
-    print('Margin stress VaR calculation completed.')
-    scenarios = np.arange(-0.05, 0.051, 0.01)
-    msa = MarginScenarioAnalysis(processed_holding, margin_account, scenarios)
-    pivot_risk_ratio, pivot_supplement = msa.run()
-    print('Margin scenario analysis completed.')
+    scenarios_r = np.arange(-0.05, 0.051, 0.01)
+    stress_test = MarginStressTestCombined(
+        processed_holding, margin_account, supplement, cov, mu, scenarios_r
+    )
+    VaR, pivot_risk_ratio, pivot_supplement = stress_test.run(n_path=100000, seed=20)
+    print('Margin stress test completed.')
 
     output = os.path.join(output_path, 'margin_analysis.xlsx')
     with pd.ExcelWriter(output) as writer:

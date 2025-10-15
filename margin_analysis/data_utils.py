@@ -1,5 +1,6 @@
 import re
 from typing import Optional
+import numpy as np
 import pandas as pd
 from base import Exchange, PositionType
 from margin_calculator import MarginCalculator
@@ -50,11 +51,12 @@ class HoldingDataProcessor:
         self.commodity_options_data = commodity_options_data
 
     def process(self) -> pd.DataFrame:
-        """处理持仓数据: 拆分多空方向持仓, 补充市场数据, 计算保证金"""
+        """处理持仓数据: 补充市场数据, 拆分多空方向持仓, 计算保证金"""
         self.holding.rename(columns={'代码': 'code', '持仓帐号': 'account'}, inplace=True)
         self.holding[['exchange', 'type', 'variety']] = self.holding['code'].apply(
             lambda code: pd.Series(parse_position_code(code)))
 
+        # 补充市场数据
         holding_futures = self.holding[self.holding['type'] == PositionType.Future].copy()
         holding_options = self.holding[self.holding['type'] == PositionType.Option].copy()
         if not holding_futures.empty:
@@ -64,6 +66,7 @@ class HoldingDataProcessor:
         dfs_to_concat = [df for df in [holding_futures, holding_options] if not df.empty]
         holding = pd.concat(dfs_to_concat, ignore_index=True)
 
+        # 拆分多空方向持仓
         holding_long = holding[holding['多头持仓'] > 0].drop(columns=['空头持仓'])
         holding_long['long_short'] = 'long'
         holding_long.rename(columns={'多头持仓': 'quantity'}, inplace=True)
@@ -76,12 +79,19 @@ class HoldingDataProcessor:
         dfs_to_concat = [df for df in [holding_long, holding_short] if not df.empty]
         holding = pd.concat(dfs_to_concat, ignore_index=True)
 
+        # 计算保证金
         self.margin_ratio_df.rename(columns={'MarginRatio': 'margin_ratio'}, inplace=True)
         holding = pd.merge(holding, self.margin_ratio_df,
                            left_on='variety', right_index=True, how='left')
         holding['margin'] = holding.apply(
             lambda pos: MarginCalculator(pos).calc(), axis=1)
         holding['total_margin'] = holding['margin'] * holding['quantity']
+
+        # 处理中金所、上期所单个账号持仓的单向大边保证金
+        dfs = []
+        for _, holding_account in holding.groupby('account'):
+            dfs.append(process_larger_side_margin(holding_account))
+        holding = pd.concat(dfs, ignore_index=True)
         return holding
 
     def _merge_futures_data(self, holding_futures: pd.DataFrame) -> pd.DataFrame:
@@ -98,7 +108,7 @@ class HoldingDataProcessor:
                                                inplace=True)
             self.commodity_futures_data = self.commodity_futures_data[columns]
         dfs_to_concat = [df for df in [self.stock_futures_data, self.commodity_futures_data]
-               if not df.empty]
+                         if not df.empty]
         futures_data = pd.concat(dfs_to_concat, ignore_index=True)
         futures_data.rename(columns={'future_code': 'code'}, inplace=True)
         holding_futures = pd.merge(holding_futures, futures_data, on='code', how='left')
@@ -121,7 +131,7 @@ class HoldingDataProcessor:
                                                inplace=True)
             self.commodity_options_data = self.commodity_options_data[columns]
         dfs_to_concat = [df for df in [self.stock_options_data, self.commodity_options_data]
-               if not df.empty]
+                         if not df.empty]
         options_data = pd.concat(dfs_to_concat, ignore_index=True)
         options_data.rename(columns={'option_code': 'code', 'option_mark_code': 'udl'},
                             inplace=True)
@@ -183,3 +193,77 @@ def parse_position_code(code: str) -> dict[str, str]:
         'type': position_type,
         'variety': variety
     }
+
+
+def process_larger_side_margin(holding_account: pd.DataFrame) -> pd.DataFrame:
+    """处理中金所、上期所单个账号持仓的单向大边保证金"""
+    exchange = holding_account['exchange'].iloc[0]
+    if exchange not in {Exchange.CFFEX, Exchange.SHFE}:
+        return holding_account
+
+    holding_futures = holding_account[holding_account['type'] == PositionType.Future]
+    if holding_futures.empty:
+        return holding_account
+
+    if exchange == Exchange.CFFEX:
+        # CFFEX: 期货对锁、跨期、跨品种
+        larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
+        mask = (
+            (holding_account['type'] == PositionType.Future) &
+            (holding_account['long_short'] != larger_side)
+        )
+        holding_account.loc[mask, ['margin', 'total_margin']] = 0
+    else:
+        # SHFE: 期货对锁、跨期
+        for variety, holding_variety in holding_futures.groupby('variety'):
+            larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
+            mask = (
+                (holding_account['type'] == PositionType.Future) &
+                (holding_account['variety'] == variety) &
+                (holding_account['long_short'] != larger_side)
+            )
+            holding_account.loc[mask, ['margin', 'total_margin']] = 0
+    return holding_account
+
+
+def calc_larger_side_margin_vectorized(holding_account: pd.DataFrame,
+                                       margins: np.ndarray) -> np.ndarray:
+    """
+    给定一系列头寸保证金情形, 考虑单向大边保证金, 计算账号持仓总保证金 (支持向量化计算)
+
+    Args:
+        holding_account (DataFrame): 单个账号的持仓数据
+        margins (ndarray): 头寸保证金情形, shape: (n_pos, *scenarios_dim)
+
+    Returns:
+        ndarray: 账号持仓总保证金, shape: (*scenarios_dim)
+    """
+    total_margin = margins.sum(axis=0)
+    exchange = holding_account['exchange'].iloc[0]
+    if exchange not in {Exchange.CFFEX, Exchange.SHFE}:
+        return total_margin
+
+    is_future = (holding_account['type'] == PositionType.Future)
+    if not is_future.any():
+        return total_margin
+
+    holding_futures = holding_account[is_future]
+    margins_futures = margins[is_future.values]
+    if exchange == Exchange.CFFEX:
+        # CFFEX: 期货对锁、跨期、跨品种
+        is_long = (holding_futures['long_short'] == 'long')
+        margin_long = margins_futures[is_long.values].sum(axis=0)
+        margin_short = margins_futures[~is_long.values].sum(axis=0)
+        smaller_side_margin = np.minimum(margin_long, margin_short)
+    else:
+        # SHFE: 期货对锁、跨期
+        smaller_side_margin = np.zeros_like(total_margin)
+        for variety in holding_futures['variety'].unique():
+            is_variety = (holding_futures['variety'] == variety)
+            holding_variety = holding_futures[is_variety]
+            margins_variety = margins_futures[is_variety.values]
+            is_long = (holding_variety['long_short'] == 'long')
+            margin_long = margins_variety[is_long.values].sum(axis=0)
+            margin_short = margins_variety[~is_long.values].sum(axis=0)
+            smaller_side_margin += np.minimum(margin_long, margin_short)
+    return total_margin - smaller_side_margin

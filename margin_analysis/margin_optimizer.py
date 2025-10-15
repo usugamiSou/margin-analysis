@@ -55,8 +55,12 @@ class MarginOptimizer:
 
     def _optimize(self, holding_account: pd.DataFrame) -> pd.DataFrame:
         """单个账号持仓的组合保证金优化"""
-        avail_strats = self._find_available_strategies(holding_account)
+        exchange = holding_account['exchange'].iloc[0]
         columns = ['code_dir', 'type', 'quantity', 'margin', 'total_margin']
+        if exchange in {Exchange.CFFEX, Exchange.SHFE}:
+            return holding_account[columns].copy()
+
+        avail_strats = self._find_available_strategies(holding_account)
         if avail_strats.empty:
             return holding_account[columns].copy()
 
@@ -93,50 +97,13 @@ class MarginOptimizer:
         else:
             raise ValueError('Optimization failed.')
 
-    def _process_CFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
-        """处理中金所账号持仓 - 单向大边保证金 (期货对锁、跨期、跨品种)"""
-        holding_account = holding_account.copy()
-        holding_futures = holding_account[holding_account['type'] == PositionType.Future]
-        if not holding_futures.empty:
-            larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
-            holding_account.loc[(
-                (holding_account['type'] == PositionType.Future) &
-                (holding_account['long_short'] != larger_side)
-            ), ['margin', 'total_margin']] = 0
-        columns = ['code_dir', 'type', 'quantity', 'margin', 'total_margin']
-        return holding_account[columns]
-
-    def _process_SHFE(self, holding_account: pd.DataFrame) -> pd.DataFrame:
-        """处理上期所账号持仓 - 单向大边保证金 (期货对锁、跨期)"""
-        holding_account = holding_account.copy()
-        holding_futures = holding_account[holding_account['type'] == PositionType.Future]
-        if not holding_futures.empty:
-            for variety, holding_variety in holding_futures.groupby('variety'):
-                larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
-                holding_account.loc[(
-                    (holding_account['type'] == PositionType.Future) &
-                    (holding_account['variety'] == variety) &
-                    (holding_account['long_short'] != larger_side)
-                ), ['margin', 'total_margin']] = 0
-        columns = ['code_dir', 'type', 'quantity', 'margin', 'total_margin']
-        return holding_account[columns]
-
-    def _process_each_account(self, holding_account: pd.DataFrame, exchange: str) -> pd.DataFrame:
-        """按交易所处理单个账号持仓"""
-        if exchange == Exchange.CFFEX:
-            return self._process_CFE(holding_account)
-        elif exchange == Exchange.SHFE:
-            return self._process_SHFE(holding_account)
-        else:
-            return self._optimize(holding_account)
-
-    def run(self, include_zero_quantities: bool = True) -> pd.DataFrame:
+    def run(self, include_zero_quantities: bool = False) -> pd.DataFrame:
         """对各账号持仓进行保证金优化"""
         temp_dfs = []
         groups = self.holding.groupby(['exchange', 'account'])
         for (exchange, account), holding_account in groups:
             holding_account.reset_index(drop=True, inplace=True)
-            optimum_account = self._process_each_account(holding_account, exchange).copy()
+            optimum_account = self._optimize(holding_account)
             optimum_account['exchange'] = exchange
             optimum_account['account'] = account
             temp_dfs.append(optimum_account)
