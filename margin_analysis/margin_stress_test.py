@@ -2,8 +2,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from base import PositionType
-from data_utils import calc_larger_side_margin_vectorized
-from margin_calculator import MarginCalculator
+from margin_utils import MarginCalculator, calc_larger_side_margin_vec
 
 
 class MarginStressTest:
@@ -23,15 +22,14 @@ class MarginStressTest:
         if pos['type'] == PositionType.Future:
             price = pos['close_price'] * (1 + r)
             pnl = (price - pos['close_price']) * quantity_dir
-            calc_margin_vec = np.vectorize(margin_calculator.calc_future)
-            margin = calc_margin_vec(close_price=price) * quantity
+            margin = MarginCalculator(pos).calc_future_vec(price) * quantity
         elif pos['type'] == PositionType.Option:
             s = pos['udl_price'] * (1 + r)
             price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
                         + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])    # delta-gamma近似
             pnl = (price - pos['close_price']) * quantity_dir
             calc_margin_vec = np.vectorize(margin_calculator.calc_option)
-            margin = calc_margin_vec(udl_price=s, close_price=price) * quantity
+            margin = MarginCalculator(pos).calc_option_vec(s, price) * quantity
         return pnl, margin
 
 
@@ -90,7 +88,7 @@ class MarginStressVaR(MarginStressTest):
                 pos, r_path[:, self.udl_idx_map[pos['udl']], :]), axis=1))
         pnl = np.sum(pnls_pos, axis=0)
         margins_pos = np.array(margins_pos)
-        margin = calc_larger_side_margin_vectorized(holding_account, margins_pos)
+        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
         return pnl, margin
 
     def calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
@@ -138,7 +136,7 @@ class MarginScenarioAnalysis(MarginStressTest):
             lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1))
         pnl = np.sum(pnls_pos, axis=0)
         margins_pos = np.array(margins_pos)
-        margin = calc_larger_side_margin_vectorized(holding_account, margins_pos)
+        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
         return pnl, margin
 
     def calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,

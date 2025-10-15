@@ -1,9 +1,8 @@
 import re
 from typing import Optional
-import numpy as np
 import pandas as pd
 from base import Exchange, PositionType
-from margin_calculator import MarginCalculator
+from margin_utils import MarginCalculator, process_larger_side_margin
 
 
 class DataLoader:
@@ -193,77 +192,3 @@ def parse_position_code(code: str) -> dict[str, str]:
         'type': position_type,
         'variety': variety
     }
-
-
-def process_larger_side_margin(holding_account: pd.DataFrame) -> pd.DataFrame:
-    """处理中金所、上期所单个账号持仓的单向大边保证金"""
-    exchange = holding_account['exchange'].iloc[0]
-    if exchange not in {Exchange.CFFEX, Exchange.SHFE}:
-        return holding_account
-
-    holding_futures = holding_account[holding_account['type'] == PositionType.Future]
-    if holding_futures.empty:
-        return holding_account
-
-    if exchange == Exchange.CFFEX:
-        # CFFEX: 期货对锁、跨期、跨品种
-        larger_side = holding_futures.groupby('long_short')['total_margin'].sum().idxmax()
-        mask = (
-            (holding_account['type'] == PositionType.Future) &
-            (holding_account['long_short'] != larger_side)
-        )
-        holding_account.loc[mask, ['margin', 'total_margin']] = 0
-    else:
-        # SHFE: 期货对锁、跨期
-        for variety, holding_variety in holding_futures.groupby('variety'):
-            larger_side = holding_variety.groupby('long_short')['total_margin'].sum().idxmax()
-            mask = (
-                (holding_account['type'] == PositionType.Future) &
-                (holding_account['variety'] == variety) &
-                (holding_account['long_short'] != larger_side)
-            )
-            holding_account.loc[mask, ['margin', 'total_margin']] = 0
-    return holding_account
-
-
-def calc_larger_side_margin_vectorized(holding_account: pd.DataFrame,
-                                       margins: np.ndarray) -> np.ndarray:
-    """
-    给定一系列头寸保证金情形, 考虑单向大边保证金, 计算账号持仓总保证金 (支持向量化计算)
-
-    Args:
-        holding_account (DataFrame): 单个账号的持仓数据
-        margins (ndarray): 头寸保证金情形, shape: (n_pos, *scenarios_dim)
-
-    Returns:
-        ndarray: 账号持仓总保证金, shape: (*scenarios_dim)
-    """
-    total_margin = margins.sum(axis=0)
-    exchange = holding_account['exchange'].iloc[0]
-    if exchange not in {Exchange.CFFEX, Exchange.SHFE}:
-        return total_margin
-
-    is_future = (holding_account['type'] == PositionType.Future)
-    if not is_future.any():
-        return total_margin
-
-    holding_futures = holding_account[is_future]
-    margins_futures = margins[is_future.values]
-    if exchange == Exchange.CFFEX:
-        # CFFEX: 期货对锁、跨期、跨品种
-        is_long = (holding_futures['long_short'] == 'long')
-        margin_long = margins_futures[is_long.values].sum(axis=0)
-        margin_short = margins_futures[~is_long.values].sum(axis=0)
-        smaller_side_margin = np.minimum(margin_long, margin_short)
-    else:
-        # SHFE: 期货对锁、跨期
-        smaller_side_margin = np.zeros_like(total_margin)
-        for variety in holding_futures['variety'].unique():
-            is_variety = (holding_futures['variety'] == variety)
-            holding_variety = holding_futures[is_variety]
-            margins_variety = margins_futures[is_variety.values]
-            is_long = (holding_variety['long_short'] == 'long')
-            margin_long = margins_variety[is_long.values].sum(axis=0)
-            margin_short = margins_variety[~is_long.values].sum(axis=0)
-            smaller_side_margin += np.minimum(margin_long, margin_short)
-    return total_margin - smaller_side_margin
