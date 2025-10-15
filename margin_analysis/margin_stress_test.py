@@ -2,6 +2,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from base import PositionType
+from data_utils import calc_larger_side_margin_vectorized
 from margin_calculator import MarginCalculator
 
 
@@ -88,7 +89,8 @@ class MarginStressVaR(MarginStressTest):
             lambda pos: self.calc_pnl_margin_r(
                 pos, r_path[:, self.udl_idx_map[pos['udl']], :]), axis=1))
         pnl = np.sum(pnls_pos, axis=0)
-        margin = np.sum(margins_pos, axis=0)
+        margins_pos = np.array(margins_pos)
+        margin = calc_larger_side_margin_vectorized(holding_account, margins_pos)
         return pnl, margin
 
     def calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
@@ -135,7 +137,8 @@ class MarginScenarioAnalysis(MarginStressTest):
         pnls_pos, margins_pos = zip(*holding_account.apply(
             lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1))
         pnl = np.sum(pnls_pos, axis=0)
-        margin = np.sum(margins_pos, axis=0)
+        margins_pos = np.array(margins_pos)
+        margin = calc_larger_side_margin_vectorized(holding_account, margins_pos)
         return pnl, margin
 
     def calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
@@ -153,7 +156,7 @@ class MarginScenarioAnalysis(MarginStressTest):
         temp_dfs = []
         for account, account_info in self.margin_account.iterrows():
             equity = account_info['equity']
-            holding_account = self.holding[self.holding['account'] == account]
+            holding_account = self.holding[self.holding['account'] == account].copy()
             holding_account.reset_index(drop=True, inplace=True)
             if holding_account.empty:
                 continue
