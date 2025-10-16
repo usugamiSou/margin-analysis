@@ -22,14 +22,13 @@ class MarginStressTest:
         if pos['type'] == PositionType.Future:
             price = pos['close_price'] * (1 + r)
             pnl = (price - pos['close_price']) * quantity_dir
-            margin = MarginCalculator(pos).calc_future_vec(price) * quantity
+            margin = margin_calculator.calc_future_vec(price) * quantity
         elif pos['type'] == PositionType.Option:
             s = pos['udl_price'] * (1 + r)
             price = (pos['close_price'] + (s - pos['udl_price']) * pos['delta']
                         + 0.5 * (s - pos['udl_price'])**2 * pos['gamma'])    # delta-gamma近似
             pnl = (price - pos['close_price']) * quantity_dir
-            calc_margin_vec = np.vectorize(margin_calculator.calc_option)
-            margin = MarginCalculator(pos).calc_option_vec(s, price) * quantity
+            margin = margin_calculator.calc_option_vec(s, price) * quantity
         return pnl, margin
 
 
@@ -80,21 +79,15 @@ class MarginStressVaR(MarginStressTest):
         r_path = np.exp(log_r_path) - 1
         return r_path
 
-    def _calc_path(self, r_path: np.ndarray, holding_account: pd.DataFrame
-                   ) -> tuple[np.ndarray, np.ndarray]:
-        """计算单个持仓账户在各标的收益率路径下的持仓盈亏与保证金, shape: (n_step, n_path)"""
-        pnls_pos, margins_pos = zip(*holding_account.apply(
-            lambda pos: self.calc_pnl_margin_r(
-                pos, r_path[:, self.udl_idx_map[pos['udl']], :]), axis=1))
-        pnl = np.sum(pnls_pos, axis=0)
-        margins_pos = np.array(margins_pos)
-        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
-        return pnl, margin
-
     def calc_risk_ratio_VaR(self, r_path: np.ndarray, holding_account: pd.DataFrame,
-                             supplement: pd.Series, equity: float | int) -> np.ndarray:
+                            supplement: pd.Series, equity: float | int) -> np.ndarray:
         """计算单个持仓账户通过模拟得到的风险度VaR, shape: (n_step,)"""
-        pnl, margin = self._calc_path(r_path, holding_account)
+        results = holding_account.apply(
+            lambda pos: self.calc_pnl_margin_r(
+                pos, r_path[:, self.udl_idx_map[pos['udl']], :]), axis=1)
+        pnls_pos, margins_pos = np.stack(results, axis=1)
+        pnl = pnls_pos.sum(axis=0)
+        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
         equity = np.full_like(pnl, fill_value=equity)
         equity += pnl + supplement.values.cumsum()[:, None]
         risk_ratio = margin / equity
@@ -112,7 +105,7 @@ class MarginStressVaR(MarginStressTest):
             holding_account.reset_index(drop=True, inplace=True)
             if holding_account.empty:
                 continue
-            remaining = max(sum(holding_account['total_margin']) - equity, 0)
+            remaining = max(holding_account['total_margin'].sum() - equity, 0)
             supplement = self.supplement.loc[account]
             risk_ratio_VaR = self._calc_risk_ratio_VaR(r_path, holding_account, supplement, equity)
             VaR_df.loc[len(VaR_df)] = [account, *risk_ratio_VaR, remaining]
@@ -129,20 +122,14 @@ class MarginScenarioAnalysis(MarginStressTest):
         super().__init__(holding, margin_account, target_risk_ratio)
         self.scenarios_r = scenarios_r
 
-    def _calc_udl_return_scenarios(self, holding_account: pd.DataFrame
-                                   ) -> tuple[np.ndarray, np.ndarray]:
-        """计算单个持仓账户在一系列标的收益率情景下的持仓盈亏与保证金"""
-        pnls_pos, margins_pos = zip(*holding_account.apply(
-            lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1))
-        pnl = np.sum(pnls_pos, axis=0)
-        margins_pos = np.array(margins_pos)
-        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
-        return pnl, margin
-
     def calc_risk_ratio_supplement(self, holding_account: pd.DataFrame,
                                     equity: float | int) -> tuple[np.ndarray, np.ndarray]:
         """计算单个持仓账户在一系列标的收益率情景下的风险度与入金"""
-        pnl, margin = self._calc_udl_return_scenarios(holding_account)
+        results = holding_account.apply(
+            lambda pos: self.calc_pnl_margin_r(pos, self.scenarios_r), axis=1)
+        pnls_pos, margins_pos = np.stack(results, axis=1)
+        pnl = pnls_pos.sum(axis=0)
+        margin = calc_larger_side_margin_vec(holding_account, margins_pos)
         equity = np.full_like(pnl, fill_value=equity)
         equity += pnl
         risk_ratio = margin / equity
@@ -193,8 +180,8 @@ class MarginStressTestCombined(MarginStressTest):
 
     def run(self, n_path: int = 10000, seed: Optional[int] = None
             ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """计算各持仓账户的风险度VaR, 以及在一系列情景下的风险度与入金"""
-        columns = ['Account'] + [f'T+{i}' for i in range(self.msv.n_step)] + ['Increasement']
+        """模拟各持仓账户的风险度VaR, 分析在一系列情景下的风险度与入金"""
+        columns = ['Account', *[f'T+{i}' for i in range(self.msv.n_step)], 'Increasement']
         VaR_df = pd.DataFrame(columns=columns)
         temp_dfs = []
         r_path = self.msv.gen_path(n_path, seed)
@@ -206,12 +193,14 @@ class MarginStressTestCombined(MarginStressTest):
             if holding_account.empty:
                 continue
             # VaR
-            remaining = max(sum(holding_account['total_margin']) - equity, 0)
+            remaining = max(holding_account['total_margin'].sum() - equity, 0)
             supplement = self.msv.supplement.loc[account]
-            risk_ratio_VaR = self.msv.calc_risk_ratio_VaR(r_path, holding_account, supplement, equity)
+            risk_ratio_VaR = self.msv.calc_risk_ratio_VaR(
+                r_path, holding_account, supplement, equity)
             VaR_df.loc[len(VaR_df)] = [account, *risk_ratio_VaR, remaining]
             # Scenario
-            risk_ratio, supplement = self.msa.calc_risk_ratio_supplement(holding_account, equity)
+            risk_ratio, supplement = self.msa.calc_risk_ratio_supplement(
+                holding_account, equity)
             temp_dfs.append(pd.DataFrame({
                 'Account': account,
                 'r': self.msa.scenarios_r,
